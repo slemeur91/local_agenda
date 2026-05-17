@@ -1,0 +1,19 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Créer un agenda local",
+        "description": "Créez un agenda qui stocke les événements localement. Vous pourrez déclencher des services HA au début et à la fin de chaque événement via un bloc YAML dans la description.",
+        "data": {
+          "calendar_name": "Nom de l'agenda"
+        }
+      }
+    },
+    "error": {
+      "invalid_name": "Le nom de l'agenda ne peut pas être vide."
+    },
+    "abort": {
+      "already_configured": "Un agenda avec ce nom existe déjà."
+    }
+  }
+}
