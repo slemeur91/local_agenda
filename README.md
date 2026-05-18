@@ -25,13 +25,23 @@ Les événements peuvent inclure un bloc spécial `---actions---` dans leur desc
 ```
 ---actions---
 on_start:
-  - service: domaine.nom_du_service
-    target: {entity_id: switch.mon_interrupteur}
-    data: {}
+  conditions:
+	- condition: state
+	  entity_id: input_select.nom_de_la_condition
+		state: Etat
+  actions:
+    - service: domaine.nom_du_service
+      data: {}
+      target:
+        entity_id:
+          - switch.mon_interrupteur
 on_stop:
-  - service: domaine.nom_du_service
-    target: {entity_id: switch.mon_interrupteur}
-    data: {}
+  actions:
+    - service: domaine.nom_du_service
+      data: {}
+      target:
+        entity_id:
+          - switch.mon_interrupteur
 ---/actions---
 ```
 
