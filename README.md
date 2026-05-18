@@ -26,9 +26,9 @@ Les événements peuvent inclure un bloc spécial `---actions---` dans leur desc
 ---actions---
 on_start:
   conditions:
-	- condition: state
-	  entity_id: input_select.nom_de_la_condition
-		state: Etat
+    - condition: state
+      entity_id: input_select.nom_de_la_condition
+        state: Etat
   actions:
     - service: domaine.nom_du_service
       data: {}
@@ -118,9 +118,9 @@ Appliqué lorsque la condition Calendrier est sur Absent
 ---actions---
 on_start:
   conditions:
-	- condition: state
-	  entity_id: input_select.calendrier
-		state: Absent
+    - condition: state
+      entity_id: input_select.calendrier
+        state: Absent
   actions:
     - service: input_select.select_option
       data:
