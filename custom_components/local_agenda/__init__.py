@@ -5,9 +5,6 @@ import logging
 from datetime import datetime, timedelta
 from pathlib import Path
 
-from aiohttp import web
-
-from homeassistant.components.http import HomeAssistantView
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.event import async_track_time_interval
@@ -22,36 +19,6 @@ PLATFORMS = ["calendar"]
 
 _PANEL_REGISTERED = False
 
-# ---------------------------------------------------------------------------
-# Brand icon views
-# ---------------------------------------------------------------------------
-# Le frontend HA charge l'icône de marque via plusieurs URL selon le contexte :
-#   icon.png      → carte intégration (panneau Appareils & Services)
-#   logo.png      → page de détail de l'intégration / appareil
-#   icon@2x.png   → variante haute résolution de l'icône
-#   logo@2x.png   → variante haute résolution du logo
-# On enregistre une vue pour chacune afin de couvrir tous les emplacements.
-_BRAND_ASSETS = ["icon.png", "logo.png", "icon@2x.png", "logo@2x.png"]
-
-
-def _make_brand_view(asset: str, icon_data: bytes) -> HomeAssistantView:
-    """Fabrique une HomeAssistantView pour une URL de marque donnée."""
-    safe_name = asset.replace(".", "_").replace("@", "_at_")
-
-    class _BrandView(HomeAssistantView):
-        url = f"/api/brands/integration/{DOMAIN}/{asset}"
-        name = f"api:brands:integration:{DOMAIN}:{safe_name}"
-        requires_auth = False
-
-        async def get(self, request: web.Request) -> web.Response:
-            return web.Response(
-                body=icon_data,
-                content_type="image/png",
-                headers={"Cache-Control": "no-cache, no-store"},
-            )
-
-    return _BrandView()
-
 
 async def async_setup(hass: HomeAssistant, config: dict) -> bool:  # type: ignore[override]
     """Register panel + WebSocket API once, before any config entry loads."""
@@ -60,25 +27,6 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:  # type: ignor
         return True
 
     component_dir = Path(__file__).parent
-
-    # -- Icônes de marque ---------------------------------------------------
-    icon_file = component_dir / "icon.png"
-    if icon_file.exists():
-        try:
-            icon_data: bytes = await hass.async_add_executor_job(icon_file.read_bytes)
-            for asset in _BRAND_ASSETS:
-                hass.http.register_view(_make_brand_view(asset, icon_data))
-                _LOGGER.debug(
-                    "local_agenda: vue brand enregistrée : /api/brands/integration/%s/%s (%d bytes)",
-                    DOMAIN, asset, len(icon_data),
-                )
-        except Exception as err:
-            _LOGGER.warning("local_agenda: impossible d'enregistrer les vues brand : %s", err)
-    else:
-        _LOGGER.warning(
-            "local_agenda: icon.png introuvable dans %s — les icônes ne s'afficheront pas",
-            component_dir,
-        )
 
     # Serve the frontend JS files via HA's HTTP server (HA 2024+ API)
     from homeassistant.components.http import StaticPathConfig
