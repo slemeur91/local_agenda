@@ -150,3 +150,8 @@ on_start:
 ## Stockage
 
 Les événements du calendrier sont stockés dans `.storage/local_agenda.{nom_du_calendrier}.ics` afin d'éviter les conflits avec l'intégration native `local_calendar`.
+
+---
+
+[releases-shield]: https://img.shields.io/github/release/slemeur91/local_agenda.svg?style=flat-square
+[releases]: https://github.com/slemeur91/local_agenda/releases
