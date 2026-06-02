@@ -1,11 +1,5 @@
 {
   "name": "Local Agenda",
-  "description": "Intégration Home Assistant pour la gestion d'un Agenda Local portant les actions.",
   "homeassistant": "2026.4.0",
-  "url": "https://github.com/slemeur91/local_agenda",
-  "category": "integration",
-  "iot_class": "local_polling",
-  "dependencies": [],
   "hacs": "2.0.0",
-  "version": "1.0.0"
 }
