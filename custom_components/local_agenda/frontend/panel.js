@@ -68,7 +68,9 @@ const STYLES = `
 
 /* Event list */
 .event-panel { width: 260px; min-width: 200px; border-right: 1px solid var(--divider-color, #e0e0e0); display: flex; flex-direction: column; background: var(--secondary-background-color, #f9f9f9); }
-.panel-header { padding: 12px 16px; font-size: 14px; font-weight: 600; color: var(--secondary-text-color); border-bottom: 1px solid var(--divider-color, #e0e0e0); text-transform: uppercase; letter-spacing: .05em; }
+.panel-header { padding: 8px 16px; font-size: 14px; font-weight: 600; color: var(--secondary-text-color); border-bottom: 1px solid var(--divider-color, #e0e0e0); text-transform: uppercase; letter-spacing: .05em; display: flex; align-items: center; justify-content: space-between; }
+.btn-refresh { background: transparent; border: none; padding: 4px 6px; cursor: pointer; color: var(--secondary-text-color); font-size: 16px; border-radius: 4px; line-height: 1; }
+.btn-refresh:hover { background: var(--secondary-background-color, #f0f0f0); color: var(--primary-color, #03a9f4); }
 .event-list { flex: 1; overflow-y: auto; padding: 8px 0; }
 .event-item { padding: 10px 16px; cursor: pointer; border-left: 3px solid transparent; margin-bottom: 2px; transition: background .15s; }
 .event-item:hover { background: var(--card-background-color, #fff); }
@@ -331,7 +333,9 @@ function readDataRows(container) {
     const vEl = row.querySelector(".data-value");
     const k = kEl ? kEl.value.trim() : "";
     const v = vEl ? vEl.value.trim() : "";
-    if (k) result[k] = v;
+    // Skip entries where key OR value is empty — an empty value passed to a
+    // service call causes failures (e.g. auto-suggested fields left blank).
+    if (k && v !== "") result[k] = v;
   });
   return result;
 }
@@ -418,9 +422,10 @@ function makeActionCard(idx, actionData, servicesMap, entityList = []) {
   body.className = "action-card-body";
 
   // ---- Service (filterable) ----
-  const svcLabel = document.createElement("label"); svcLabel.textContent = "Service HA";
+  const svcLabel = document.createElement("label");
+  svcLabel.innerHTML = "Service HA &nbsp;<span style='font-weight:400;color:var(--secondary-text-color);'>(domaine = type d'entité)</span>";
   const { wrapper: svcWrapper, input: svcInput } = makeFilterableInput({
-    placeholder: "domaine.service  (ex: input_select.select_option)",
+    placeholder: "type_entité.action  (ex: switch.turn_on, light.turn_on)",
     value: actionData.service || "",
     options: svcList,
     className: "svc-input",
@@ -633,7 +638,36 @@ class LocalAgendaPanel extends HTMLElement {
 
   async _init() {
     this._render();
+    // Wire up the refresh button
+    const refreshBtn = this._shadow.getElementById("la-refresh-btn");
+    if (refreshBtn) refreshBtn.onclick = () => this._refreshEvents();
     await Promise.all([this._loadCalendars(), this._loadHaData()]);
+  }
+
+  async _refreshEvents() {
+    if (!this._selectedCalendar) return;
+    try {
+      const refreshBtn = this._shadow.getElementById("la-refresh-btn");
+      if (refreshBtn) { refreshBtn.textContent = "…"; refreshBtn.disabled = true; }
+      this._events = await callWS(this._hass, {
+        type: "local_agenda/get_events",
+        entry_id: this._selectedCalendar.entry_id,
+      });
+      // If the selected event no longer exists, clear the selection
+      if (this._selectedEvent && !this._events.find(e => e.uid === this._selectedEvent.uid)) {
+        this._selectedEvent = null;
+        this._currentActions = {};
+        this._dirty = false;
+        this._renderEditor();
+        this._showToast("L'événement sélectionné n'existe plus.", "error");
+      }
+      this._renderEventList();
+    } catch (err) {
+      this._showToast("Erreur lors du rafraîchissement : " + err, "error");
+    } finally {
+      const refreshBtn = this._shadow.getElementById("la-refresh-btn");
+      if (refreshBtn) { refreshBtn.textContent = "↺"; refreshBtn.disabled = false; }
+    }
   }
 
   // ---- Data loading ----
@@ -688,7 +722,19 @@ class LocalAgendaPanel extends HTMLElement {
       });
       this._currentActions = res.actions || {};
       this._renderEditor();
-    } catch (e) { this._showToast("Erreur chargement actions : " + e, "error"); }
+    } catch (e) {
+      // The event may have been deleted since the list was last loaded
+      const msg = String(e);
+      if (msg.includes("not_found")) {
+        this._showToast("Cet événement n'existe plus — rafraîchissement de la liste…", "error");
+        this._selectedEvent = null;
+        this._currentActions = {};
+        this._renderEditor();
+        await this._refreshEvents();
+      } else {
+        this._showToast("Erreur chargement actions : " + e, "error");
+      }
+    }
   }
 
   async _save() {
@@ -728,7 +774,10 @@ class LocalAgendaPanel extends HTMLElement {
           <div class="cal-list"><div class="loading">Chargement…</div></div>
         </div>
         <div class="event-panel">
-          <div class="panel-header">Événements</div>
+          <div class="panel-header">
+            <span>Événements</span>
+            <button class="btn-refresh" id="la-refresh-btn" title="Rafraîchir la liste">↺</button>
+          </div>
           <div class="event-list"><div class="loading">Sélectionner un calendrier</div></div>
         </div>
         <div class="editor">
