@@ -148,6 +148,11 @@ Cliquez sur un événement dans le calendrier, puis sur le crayon ✏️. Le cha
 
 ## Création et modification des actions
 
+Les actions peuvent être définies de deux façons :
+
+- **Directement dans la description de l'événement** via le calendrier HA, en saisissant manuellement le bloc YAML `---actions---` (méthode recommandée).
+- **Via le panneau Local Agenda** accessible depuis le menu de HA, qui propose un éditeur intégré (fonctionnalité en cours d'épreuve).
+
 ### Syntaxe des actions
 
 Les événements peuvent inclure un bloc spécial `---actions---` dans leur description pour définir les services à déclencher. Le bloc utilise la syntaxe YAML.
