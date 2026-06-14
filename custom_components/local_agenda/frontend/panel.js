@@ -2,7 +2,7 @@
 // Vanilla JS custom element, no build step required.
 // Registered automatically by the integration via async_register_built_in_panel.
 
-const VERSION = "1.2.0";
+const VERSION = "1.3.0";
 
 // ---------------------------------------------------------------------------
 // Minimal YAML serialiser (limited to the action schema we produce)
@@ -72,12 +72,16 @@ const STYLES = `
 .btn-refresh { background: transparent; border: none; padding: 4px 6px; cursor: pointer; color: var(--secondary-text-color); font-size: 16px; border-radius: 4px; line-height: 1; }
 .btn-refresh:hover { background: var(--secondary-background-color, #f0f0f0); color: var(--primary-color, #03a9f4); }
 .event-list { flex: 1; overflow-y: auto; padding: 8px 0; }
-.event-item { padding: 10px 16px; cursor: pointer; border-left: 3px solid transparent; margin-bottom: 2px; transition: background .15s; }
+.event-item { padding: 6px 8px 6px 16px; cursor: pointer; border-left: 3px solid transparent; margin-bottom: 2px; transition: background .15s; display: flex; align-items: center; gap: 4px; }
 .event-item:hover { background: var(--card-background-color, #fff); }
 .event-item.active { border-left-color: var(--primary-color, #03a9f4); background: var(--card-background-color, #fff); }
 .event-item.has-actions .event-name::after { content: " ⚡"; font-size: 12px; }
+.event-item-info { flex: 1; min-width: 0; padding: 4px 0; }
 .event-name { font-size: 14px; font-weight: 500; color: var(--primary-text-color); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .event-meta { font-size: 12px; color: var(--secondary-text-color); margin-top: 2px; }
+.btn-delete-event { flex-shrink: 0; background: transparent; border: none; padding: 4px 6px; border-radius: 4px; font-size: 15px; color: var(--secondary-text-color); cursor: pointer; opacity: 0; transition: opacity .15s, color .15s; line-height: 1; }
+.event-item:hover .btn-delete-event { opacity: 1; }
+.btn-delete-event:hover { color: #e53935 !important; background: rgba(229,57,53,.1); opacity: 1; }
 
 /* Editor */
 .editor { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
@@ -824,12 +828,65 @@ class LocalAgendaPanel extends HTMLElement {
       item.className = "event-item" +
         (evt.has_actions ? " has-actions" : "") +
         (this._selectedEvent?.uid === evt.uid ? " active" : "");
-      item.innerHTML = `
-        <div class="event-name">${evt.rrule ? "🔁 " : ""}${evt.summary || "(sans titre)"}</div>
+
+      // Info zone (click = select event)
+      const info = document.createElement("div");
+      info.className = "event-item-info";
+      info.innerHTML = `
+        <div class="event-name">${evt.rrule ? "🔁 " : ""}${escHtml(evt.summary || "(sans titre)")}</div>
         <div class="event-meta">${(evt.start || "").substring(0, 10)}</div>`;
-      item.onclick = () => this._selectEvent(evt);
+      info.onclick = () => this._selectEvent(evt);
+
+      // Delete button (click = delete without selecting)
+      const delBtn = document.createElement("button");
+      delBtn.type = "button";
+      delBtn.className = "btn-delete-event";
+      delBtn.title = evt.rrule
+        ? "Supprimer tous les évènements de cette série"
+        : "Supprimer cet évènement";
+      delBtn.textContent = "🗑";
+      delBtn.onclick = (e) => { e.stopPropagation(); this._deleteEvent(evt); };
+
+      item.append(info, delBtn);
       list.appendChild(item);
     });
+  }
+
+  async _deleteEvent(evt) {
+    const isRecurring = !!evt.rrule;
+    const name = evt.summary || "(sans titre)";
+    const msg = isRecurring
+      ? `Supprimer tous les évènements de la série « ${name} » ?\n(toutes les occurrences, passées et futures, seront supprimées)`
+      : `Supprimer l'évènement « ${name} » ?`;
+
+    if (!confirm(msg)) return;
+
+    try {
+      // 1. Supprimer la série entière (master + toutes les exceptions RECURRENCE-ID)
+      await callWS(this._hass, {
+        type: "local_agenda/delete_event",
+        entry_id: this._selectedCalendar.entry_id,
+        uid: evt.uid,
+      });
+
+      this._showToast(
+        isRecurring ? "Série supprimée ✓" : "Évènement supprimé ✓",
+        "success"
+      );
+
+      // Si l'événement supprimé était sélectionné, vider l'éditeur
+      if (this._selectedEvent?.uid === evt.uid) {
+        this._selectedEvent = null;
+        this._currentActions = {};
+        this._dirty = false;
+        this._renderEditor();
+      }
+
+      // Rafraîchir la liste
+      await this._refreshEvents();
+    } catch (e) {
+      this._showToast("Erreur lors de la suppression : " + e, "error");
+    }
   }
 
   _renderEditor() {

@@ -24,6 +24,7 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_get_events)
     websocket_api.async_register_command(hass, ws_get_actions)
     websocket_api.async_register_command(hass, ws_set_actions)
+    websocket_api.async_register_command(hass, ws_delete_event)
     websocket_api.async_register_command(hass, ws_get_ha_services)
     websocket_api.async_register_command(hass, ws_get_ha_entities)
 
@@ -234,6 +235,64 @@ async def ws_set_actions(
             pass
 
     connection.send_result(msg["id"], {"ok": True})
+
+
+# ---------------------------------------------------------------------------
+# delete_event
+# ---------------------------------------------------------------------------
+
+
+@websocket_api.websocket_command(
+    {
+        vol.Required("type"): "local_agenda/delete_event",
+        vol.Required("entry_id"): str,
+        vol.Required("uid"): str,
+    }
+)
+@websocket_api.async_response
+async def ws_delete_event(
+    hass: HomeAssistant,
+    connection: websocket_api.ActiveConnection,
+    msg: dict,
+) -> None:
+    """Delete all VEVENTs with the given UID (master event + all RECURRENCE-ID exceptions)."""
+    entry_id = msg["entry_id"]
+    uid = msg["uid"]
+
+    store = hass.data.get(DOMAIN, {}).get(entry_id, {}).get("store")
+    if store is None:
+        connection.send_error(msg["id"], "not_found", "Calendar entry not found")
+        return
+
+    cal = store.get_calendar()
+    before = len(cal.subcomponents)
+    cal.subcomponents = [
+        c for c in cal.subcomponents
+        if not (
+            c.name == "VEVENT"
+            and str(c.get("uid", "")) == uid
+        )
+    ]
+    removed = before - len(cal.subcomponents)
+
+    if removed == 0:
+        connection.send_error(msg["id"], "not_found", f"Event {uid} not found")
+        return
+
+    await store.async_save(hass)
+
+    # Refresh entities so HA state reflects the deletion immediately
+    for entity in hass.data.get(DOMAIN, {}).get(entry_id, {}).get("entities", []):
+        try:
+            await entity._refresh_next_event()
+            entity.async_write_ha_state()
+        except Exception:
+            pass
+
+    _LOGGER.debug(
+        "local_agenda: deleted %d VEVENT component(s) for uid=%s", removed, uid
+    )
+    connection.send_result(msg["id"], {"ok": True, "removed": removed})
 
 
 # ---------------------------------------------------------------------------
