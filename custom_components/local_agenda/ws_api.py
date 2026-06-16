@@ -281,11 +281,14 @@ async def ws_delete_event(
 
     await store.async_save(hass)
 
-    # Refresh entities so HA state reflects the deletion immediately
+    # Refresh entities so HA state reflects the deletion immediately, and
+    # notify any open Local Agenda panel (this tab or another) so its event
+    # list refreshes too — see LocalAgendaEntity._notify_panel_updated().
     for entity in hass.data.get(DOMAIN, {}).get(entry_id, {}).get("entities", []):
         try:
             await entity._refresh_next_event()
             entity.async_write_ha_state()
+            entity._notify_panel_updated()
         except Exception:
             pass
 

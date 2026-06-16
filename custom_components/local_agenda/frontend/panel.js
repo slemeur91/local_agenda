@@ -2,7 +2,7 @@
 // Vanilla JS custom element, no build step required.
 // Registered automatically by the integration via async_register_built_in_panel.
 
-const VERSION = "1.5.2";
+const VERSION = "1.7.0";
 console.info(`%c[local_agenda] panel.js v${VERSION} loaded`, "color:#03a9f4;font-weight:bold;");
 
 // ---------------------------------------------------------------------------
@@ -748,6 +748,7 @@ class LocalAgendaPanel extends HTMLElement {
     this._entityAttrs = {};  // { entity_id: attributes } — used for known option lists
     this._currentActions = {};
     this._dirty = false;
+    this._unsubUpdated = null; // unsubscribe fn for the "local_agenda_updated" bus event
   }
 
   set hass(hass) {
@@ -758,11 +759,39 @@ class LocalAgendaPanel extends HTMLElement {
 
   set panel(p) { this._panel = p; }
 
+  // Backend fires "local_agenda_updated" (see LocalAgendaEntity._notify_panel_updated
+  // in calendar.py) whenever an event is created/updated/deleted — from this panel,
+  // HA's built-in calendar UI, an automation, anywhere. We rely on this instead of
+  // watching entity state, because HA skips updating the entity's state/last_updated
+  // when neither the visible state string nor its attributes actually change (e.g.
+  // deleting an event that wasn't the "next upcoming" one shown by the entity).
+  _subscribeToUpdates() {
+    if (!this._hass || !this._hass.connection) return;
+    this._hass.connection
+      .subscribeEvents((ev) => {
+        const entryId = ev && ev.data && ev.data.entry_id;
+        if (
+          this._selectedCalendar &&
+          entryId === this._selectedCalendar.entry_id &&
+          !this._dirty
+        ) {
+          this._refreshEvents();
+        }
+      }, "local_agenda_updated")
+      .then((unsub) => { this._unsubUpdated = unsub; })
+      .catch((e) => console.warn("local_agenda: could not subscribe to updates", e));
+  }
+
+  disconnectedCallback() {
+    if (this._unsubUpdated) { this._unsubUpdated(); this._unsubUpdated = null; }
+  }
+
   async _init() {
     this._render();
     // Wire up the refresh button
     const refreshBtn = this._shadow.getElementById("la-refresh-btn");
     if (refreshBtn) refreshBtn.onclick = () => this._refreshEvents();
+    this._subscribeToUpdates();
     await Promise.all([this._loadCalendars(), this._loadHaData()]);
   }
 

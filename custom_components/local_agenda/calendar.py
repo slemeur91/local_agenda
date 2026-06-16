@@ -62,6 +62,7 @@ class LocalAgendaEntity(CalendarEntity):
         self._store = store
         self._attr_name = name
         self._attr_unique_id = f"local_agenda_{entry_id}"
+        self._entry_id = entry_id
         # Cache for the next upcoming event — updated in async_update and after CRUD
         self._next_event: CalendarEvent | None = None
 
@@ -89,6 +90,17 @@ class LocalAgendaEntity(CalendarEntity):
             self._expand_events, now, now + timedelta(days=365)
         )
         self._next_event = events[0] if events else None
+
+    def _notify_panel_updated(self) -> None:
+        """Fire a bus event so the Local Agenda panel can refresh its event
+        list immediately. Needed because async_write_ha_state() alone is not
+        a reliable signal for the frontend panel: HA skips updating the
+        entity's state/last_updated when neither the visible state string
+        nor its attributes actually changed (e.g. deleting an event that
+        wasn't the "next upcoming" one shown by the entity). The panel
+        subscribes to this event directly instead of polling entity state.
+        """
+        self._hass.bus.async_fire(f"{DOMAIN}_updated", {"entry_id": self._entry_id})
 
     async def async_get_events(
         self,
@@ -208,6 +220,7 @@ class LocalAgendaEntity(CalendarEntity):
         await self._store.async_save(self._hass)
         await self._refresh_next_event()
         self.async_write_ha_state()
+        self._notify_panel_updated()
 
     async def async_delete_event(
         self,
@@ -266,7 +279,28 @@ class LocalAgendaEntity(CalendarEntity):
                     master_component = component
                     break
 
-            if master_component is not None:
+            # HA's native calendar UI sends a recurrence_id (matching DTSTART)
+            # even when deleting a perfectly ordinary, non-recurring event —
+            # not just for genuine occurrences of a recurring series. If the
+            # master VEVENT has no RRULE at all, there is no series to
+            # "exclude an occurrence from": adding an EXDATE in that case is
+            # a silent no-op (EXDATE only suppresses RRULE-generated
+            # occurrences), so the event would wrongly keep appearing
+            # forever. Detect that case and fall back to deleting the whole
+            # VEVENT, exactly as if recurrence_id had been None.
+            if master_component is not None and master_component.get("rrule") is None:
+                before = len(cal.subcomponents)
+                cal.subcomponents = [
+                    c for c in cal.subcomponents
+                    if not (c.name == "VEVENT" and str(c.get("uid", "")) == uid)
+                ]
+                _LOGGER.debug(
+                    "local_agenda: delete_event — recurrence_id given but "
+                    "master has no RRULE (non-recurring event); deleted "
+                    "whole event, removed %d component(s)",
+                    before - len(cal.subcomponents),
+                )
+            elif master_component is not None:
                 if recurrence_range == "THISANDFUTURE" and rec_dt is not None:
                     # Truncate: set UNTIL to the moment before this occurrence.
                     # Edge case: if rec_dt <= DTSTART the RRULE would still let
@@ -363,6 +397,7 @@ class LocalAgendaEntity(CalendarEntity):
         await self._store.async_save(self._hass)
         await self._refresh_next_event()
         self.async_write_ha_state()
+        self._notify_panel_updated()
 
     async def async_update_event(
         self,
@@ -782,6 +817,7 @@ class LocalAgendaEntity(CalendarEntity):
         await self._store.async_save(self._hass)
         await self._refresh_next_event()
         self.async_write_ha_state()
+        self._notify_panel_updated()
 
 
 # ------------------------------------------------------------------
