@@ -2,7 +2,8 @@
 // Vanilla JS custom element, no build step required.
 // Registered automatically by the integration via async_register_built_in_panel.
 
-const VERSION = "1.3.0";
+const VERSION = "1.5.2";
+console.info(`%c[local_agenda] panel.js v${VERSION} loaded`, "color:#03a9f4;font-weight:bold;");
 
 // ---------------------------------------------------------------------------
 // Minimal YAML serialiser (limited to the action schema we produce)
@@ -181,6 +182,39 @@ function callWS(hass, msg) {
 // TARGET fields that belong in the target section, not in data
 const TARGET_FIELDS = new Set(["entity_id", "area_id", "device_id"]);
 
+// Maps a service-data field name to the entity attribute that holds its
+// known list of valid values — e.g. input_select/select "option" → state
+// attribute "options". Used to turn a plain text value field into a
+// filterable dropdown built from the *current* values exposed by the
+// selected target entity, instead of free text.
+const FIELD_OPTION_ATTR = {
+  option: "options",                 // input_select.select_option, select.select_option
+  hvac_mode: "hvac_modes",           // climate.set_hvac_mode
+  preset_mode: "preset_modes",       // climate.set_preset_mode, fan.set_preset_mode
+  fan_mode: "fan_modes",             // climate.set_fan_mode
+  swing_mode: "swing_modes",         // climate.set_swing_mode
+  mode: "available_modes",           // humidifier.set_mode
+  source: "source_list",             // media_player.select_source
+  sound_mode: "sound_mode_list",     // media_player.select_sound_mode
+  fan_speed: "fan_speed_list",       // vacuum.set_fan_speed
+  operation_mode: "operation_list",  // water_heater.set_operation_mode
+};
+
+/**
+ * Resolve the list of known valid values for a given data field, based on
+ * the attributes of the currently selected target entity (uses the first
+ * one if several entities are targeted).
+ */
+function getFieldOptions(fieldKey, targetVal, entityAttrs) {
+  const attrName = FIELD_OPTION_ATTR[(fieldKey || "").trim().toLowerCase()];
+  if (!attrName || !targetVal) return [];
+  const firstEntity = targetVal.split(",")[0].trim();
+  const attrs = entityAttrs && entityAttrs[firstEntity];
+  if (!attrs) return [];
+  const list = attrs[attrName];
+  return Array.isArray(list) ? list.map(String) : [];
+}
+
 // ---------------------------------------------------------------------------
 // Filterable autocomplete input
 // ---------------------------------------------------------------------------
@@ -202,7 +236,8 @@ function escHtml(str) {
  *   onSelect     – callback(selectedValue) called when an option is chosen
  * @returns {{ wrapper: HTMLElement, input: HTMLInputElement }}
  */
-function makeFilterableInput({ placeholder = "", value = "", options = [], className = "", maxResults = 60, onSelect = null } = {}) {
+function makeFilterableInput({ placeholder = "", value = "", options: initialOptions = [], className = "", maxResults = 60, onSelect = null } = {}) {
+  let options = initialOptions;
   const wrapper = document.createElement("div");
   wrapper.className = "la-autocomplete";
 
@@ -303,13 +338,39 @@ function makeFilterableInput({ placeholder = "", value = "", options = [], class
   });
 
   wrapper.append(input, dropdown);
-  return { wrapper, input };
+
+  // Allows callers to swap the completion list after creation (e.g. narrowing
+  // the entity list down to a domain once a service is selected).
+  function setOptions(newOptions) {
+    options = newOptions || [];
+  }
+
+  return { wrapper, input, setOptions };
 }
 
 // ---------------------------------------------------------------------------
 // Data row (key / value pair inside a service's data section)
 // ---------------------------------------------------------------------------
-function makeDataRow(key = "", value = "") {
+/**
+ * Builds the value field for a data row — a plain text input by default,
+ * or a filterable dropdown when `options` (the entity's known valid values)
+ * is non-empty. Always exposes the underlying <input class="data-value">
+ * so readDataRows() keeps working unchanged either way.
+ */
+function makeDataValueField(value = "", options = []) {
+  if (options && options.length) {
+    const { wrapper } = makeFilterableInput({
+      placeholder: "valeur", value, options, className: "data-value",
+    });
+    return wrapper;
+  }
+  const input = document.createElement("input");
+  input.type = "text"; input.placeholder = "valeur"; input.value = value;
+  input.className = "data-value";
+  return input;
+}
+
+function makeDataRow(key = "", value = "", options = []) {
   const row = document.createElement("div");
   row.className = "data-row";
 
@@ -317,16 +378,14 @@ function makeDataRow(key = "", value = "") {
   kInput.type = "text"; kInput.placeholder = "clé"; kInput.value = key;
   kInput.className = "data-key";
 
-  const vInput = document.createElement("input");
-  vInput.type = "text"; vInput.placeholder = "valeur"; vInput.value = value;
-  vInput.className = "data-value";
+  const vField = makeDataValueField(value, options);
 
   const del = document.createElement("button");
   del.type = "button";
   del.className = "btn-icon"; del.textContent = "✕"; del.title = "Supprimer";
   del.onclick = () => row.remove();
 
-  row.append(kInput, vInput, del);
+  row.append(kInput, vField, del);
   return row;
 }
 
@@ -397,7 +456,7 @@ function readCondRow(row) {
 // ---------------------------------------------------------------------------
 // Action card
 // ---------------------------------------------------------------------------
-function makeActionCard(idx, actionData, servicesMap, entityList = []) {
+function makeActionCard(idx, actionData, servicesMap, entityList = [], entityAttrs = {}) {
   // Flat sorted list of "domain.service" strings derived from servicesMap
   const svcList = [];
   for (const [domain, svcs] of Object.entries(servicesMap || {})) {
@@ -435,7 +494,7 @@ function makeActionCard(idx, actionData, servicesMap, entityList = []) {
     className: "svc-input",
   });
 
-  // ---- Target entity_id (filterable) ----
+  // ---- Target entity_id (filterable, narrowed to the service's domain when possible) ----
   const targetLabel = document.createElement("label"); targetLabel.textContent = "Entité cible (target.entity_id)";
   const tgt = actionData.target || {};
   let targetVal = "";
@@ -443,10 +502,24 @@ function makeActionCard(idx, actionData, servicesMap, entityList = []) {
   else if (tgt.entity_id) targetVal = tgt.entity_id;
   else if (actionData.entity_id) targetVal = actionData.entity_id;
 
-  const { wrapper: targetWrapper, input: targetInput } = makeFilterableInput({
+  // Narrows the entity list to the domain implied by the selected service
+  // (e.g. light.turn_on -> only light.* entities). If no domain can be
+  // determined, or no entity of that domain exists (generic services like
+  // homeassistant.turn_on, script.turn_on with no script entities, …),
+  // falls back to the full unfiltered list.
+  function entityOptionsForCurrentService() {
+    const svcFull = svcInput.value.trim();
+    const dotIdx = svcFull.indexOf(".");
+    if (dotIdx <= 0) return entityList;
+    const domain = svcFull.substring(0, dotIdx);
+    const filtered = entityList.filter(e => e.startsWith(domain + "."));
+    return filtered.length ? filtered : entityList;
+  }
+
+  const { wrapper: targetWrapper, input: targetInput, setOptions: setTargetOptions } = makeFilterableInput({
     placeholder: "light.salon  (ou plusieurs séparées par virgule)",
     value: targetVal,
-    options: entityList,
+    options: entityOptionsForCurrentService(),
     className: "target-input",
   });
 
@@ -462,24 +535,65 @@ function makeActionCard(idx, actionData, servicesMap, entityList = []) {
   addDataBtn.className = "btn-add";
   addDataBtn.textContent = "+ Ajouter un champ";
   addDataBtn.style.cssText = "font-size:11px;padding:4px 8px;";
-  addDataBtn.onclick = () => dataContainer.appendChild(makeDataRow());
+  addDataBtn.onclick = () => addDataRow();
   dataTitleRow.appendChild(addDataBtn);
 
   const dataContainer = document.createElement("div");
   dataContainer.className = "data-container";
 
+  // Adds a data row whose value field is a filterable dropdown when the
+  // target entity exposes a known list of values for this field (e.g.
+  // "option" on an input_select/select, "hvac_mode" on a climate…),
+  // falling back to free text otherwise.
+  function addDataRow(key = "", value = "") {
+    const options = getFieldOptions(key, targetInput.value.trim(), entityAttrs);
+    const row = makeDataRow(key, value, options);
+    const kEl = row.querySelector(".data-key");
+    // Listen on both "input" (live, while typing — no need to blur first)
+    // and "change" (covers programmatic value updates) so the dropdown
+    // appears as soon as a known field name like "option" is typed.
+    kEl.addEventListener("input", () => refreshRowValueField(row));
+    kEl.addEventListener("change", () => refreshRowValueField(row));
+    dataContainer.appendChild(row);
+    return row;
+  }
+
+  // Re-evaluates a row's value field (text vs. dropdown + options) — called
+  // when its key changes, or when the target entity changes.
+  function refreshRowValueField(row) {
+    const kEl = row.querySelector(".data-key");
+    const key = kEl ? kEl.value.trim() : "";
+    const valEl = row.querySelector(".data-value");
+    if (!valEl) return;
+    const oldVal = valEl.value;
+    const options = getFieldOptions(key, targetInput.value.trim(), entityAttrs);
+    const newField = makeDataValueField(oldVal, options);
+    const oldField = valEl.closest(".la-autocomplete") || valEl;
+    oldField.replaceWith(newField);
+  }
+
   // Pre-fill existing data fields
   const existingData = actionData.data || {};
   Object.entries(existingData).forEach(([k, v]) => {
-    dataContainer.appendChild(makeDataRow(k, String(v)));
+    addDataRow(k, String(v));
   });
 
   const dataHint = document.createElement("div");
   dataHint.className = "data-hint";
-  dataHint.textContent = "Les champs connus du service apparaissent automatiquement lors de la sélection.";
+  dataHint.textContent = "Les champs connus du service apparaissent automatiquement lors de la sélection. Si l'entité cible expose une liste de valeurs connues (input_select, select, climate…), la valeur se choisit dans une liste déroulante.";
 
   dataSection.append(dataTitleRow, dataContainer, dataHint);
   body.append(svcLabel, svcWrapper, targetLabel, targetWrapper, dataSection);
+
+  // When the target entity changes, re-evaluate every row's value field
+  // (e.g. switching from one input_select to another with different options).
+  // Bound on both "input" and "change" so it also reacts while typing the
+  // entity_id manually, not just after picking it from the dropdown/blurring.
+  function refreshAllRowValueFields() {
+    dataContainer.querySelectorAll(".data-row").forEach(refreshRowValueField);
+  }
+  targetInput.addEventListener("input", refreshAllRowValueFields);
+  targetInput.addEventListener("change", refreshAllRowValueFields);
 
   // ---- Auto-suggest fields on service change ----
   function autoFillFields() {
@@ -498,7 +612,7 @@ function makeActionCard(idx, actionData, servicesMap, entityList = []) {
     Object.keys(svcDef.fields).forEach(field => {
       if (TARGET_FIELDS.has(field)) return;
       if (!existingKeys.has(field)) {
-        dataContainer.appendChild(makeDataRow(field, ""));
+        addDataRow(field, "");
         existingKeys.add(field);
       }
     });
@@ -508,7 +622,10 @@ function makeActionCard(idx, actionData, servicesMap, entityList = []) {
     }
   }
 
-  svcInput.addEventListener("change", autoFillFields);
+  svcInput.addEventListener("change", () => {
+    setTargetOptions(entityOptionsForCurrentService());
+    autoFillFields();
+  });
   if (actionData.service && servicesMap) autoFillFields();
 
   card.append(hdr, body);
@@ -533,7 +650,7 @@ function readActionCard(card) {
 // ---------------------------------------------------------------------------
 // Phase block (on_start or on_stop)
 // ---------------------------------------------------------------------------
-function makePhaseBlock(phase, phaseData, servicesMap, entityList = []) {
+function makePhaseBlock(phase, phaseData, servicesMap, entityList = [], entityAttrs = {}) {
   const isStart = phase === "on_start";
   const block = document.createElement("div");
   block.className = "phase-block";
@@ -582,7 +699,7 @@ function makePhaseBlock(phase, phaseData, servicesMap, entityList = []) {
   else if (phaseData && typeof phaseData === "object") existingActions = phaseData.actions || [];
 
   existingActions.forEach((a, i) => {
-    actionsContainer.appendChild(makeActionCard(i, a, servicesMap, entityList));
+    actionsContainer.appendChild(makeActionCard(i, a, servicesMap, entityList, entityAttrs));
   });
 
   const actTitleRow = document.createElement("div");
@@ -593,7 +710,7 @@ function makePhaseBlock(phase, phaseData, servicesMap, entityList = []) {
   addActionBtn.className = "btn-add"; addActionBtn.textContent = "+ Ajouter un appel de service";
   addActionBtn.onclick = () => {
     const idx = actionsContainer.querySelectorAll(".action-card").length;
-    actionsContainer.appendChild(makeActionCard(idx, {}, servicesMap, entityList));
+    actionsContainer.appendChild(makeActionCard(idx, {}, servicesMap, entityList, entityAttrs));
   };
   actTitleRow.appendChild(addActionBtn);
 
@@ -628,6 +745,7 @@ class LocalAgendaPanel extends HTMLElement {
     this._selectedEvent = null;
     this._servicesMap = {};  // { domain: { service: { fields: {...} } } }
     this._entityList = [];   // flat sorted list of entity_id strings
+    this._entityAttrs = {};  // { entity_id: attributes } — used for known option lists
     this._currentActions = {};
     this._dirty = false;
   }
@@ -689,8 +807,15 @@ class LocalAgendaPanel extends HTMLElement {
       const raw = await callWS(this._hass, { type: "get_services" });
       this._servicesMap = raw || {};
 
-      // Entities from hass.states (always up to date)
-      this._entityList = Object.keys(this._hass.states || {}).sort();
+      // Entities + their attributes, from hass.states (always up to date).
+      // Attributes feed the known-option dropdowns (input_select.options,
+      // climate.hvac_modes, media_player.source_list, etc.).
+      const states = this._hass.states || {};
+      this._entityList = Object.keys(states).sort();
+      this._entityAttrs = {};
+      for (const [entityId, st] of Object.entries(states)) {
+        this._entityAttrs[entityId] = (st && st.attributes) || {};
+      }
     } catch (e) {
       console.warn("local_agenda: could not load HA services/entities", e);
     }
@@ -929,8 +1054,8 @@ class LocalAgendaPanel extends HTMLElement {
     info.style.cssText = "background:#e3f2fd;border-radius:6px;padding:12px 16px;font-size:13px;color:#1565c0;border:1px solid #90caf9;";
     info.innerHTML = "ℹ️  Tapez une partie du nom pour filtrer les services ou les entités. Les flèches ↑↓ et Entrée permettent de naviguer dans la liste.";
 
-    const startBlock = makePhaseBlock("on_start", this._currentActions.on_start || null, this._servicesMap, this._entityList);
-    const stopBlock  = makePhaseBlock("on_stop",  this._currentActions.on_stop  || null, this._servicesMap, this._entityList);
+    const startBlock = makePhaseBlock("on_start", this._currentActions.on_start || null, this._servicesMap, this._entityList, this._entityAttrs);
+    const stopBlock  = makePhaseBlock("on_stop",  this._currentActions.on_stop  || null, this._servicesMap, this._entityList, this._entityAttrs);
 
     body.append(info, startBlock, stopBlock);
     editor.append(hdr, body);

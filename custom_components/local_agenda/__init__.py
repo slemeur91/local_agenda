@@ -35,6 +35,17 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:  # type: ignor
         StaticPathConfig("/local_agenda_ui", str(frontend_path), cache_headers=False)
     ])
 
+    # Cache-bust the panel script URL with the file's mtime so that browsers
+    # never keep serving a stale cached copy of panel.js after an edit + HA
+    # restart — each change to the file produces a different js_url, forcing
+    # a fresh fetch on the next full page reload (a plain HA restart alone
+    # does NOT make an already-open browser tab re-fetch the script).
+    panel_js_path = frontend_path / "panel.js"
+    try:
+        cache_bust = str(int(panel_js_path.stat().st_mtime))
+    except OSError:
+        cache_bust = "0"
+
     # Add "Local Agenda" to the HA sidebar — no user action needed
     try:
         from homeassistant.components.frontend import async_register_built_in_panel
@@ -47,7 +58,7 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:  # type: ignor
             config={
                 "_panel_custom": {
                     "name": "local-agenda-panel",
-                    "js_url": "/local_agenda_ui/panel.js",
+                    "js_url": f"/local_agenda_ui/panel.js?v={cache_bust}",
                     "embed_iframe": False,
                     "trust_external_script": False,
                 }
