@@ -2,7 +2,7 @@
 // Vanilla JS custom element, no build step required.
 // Registered automatically by the integration via async_register_built_in_panel.
 
-const VERSION = "1.7.0";
+const VERSION = "1.8.2";
 console.info(`%c[local_agenda] panel.js v${VERSION} loaded`, "color:#03a9f4;font-weight:bold;");
 
 // ---------------------------------------------------------------------------
@@ -102,15 +102,31 @@ const STYLES = `
 
 /* Conditions block */
 .cond-block { background: var(--secondary-background-color, #f5f5f5); border-radius: 6px; padding: 12px 16px; border: 1px solid var(--divider-color, #e0e0e0); }
-.cond-block-title { font-size: 13px; font-weight: 600; color: var(--secondary-text-color); margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; }
+.cond-block-title { font-size: 13px; font-weight: 600; color: var(--secondary-text-color); margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.cond-block-title-left { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; cursor: pointer; }
+.cond-block.collapsed .cond-list { display: none; }
 .cond-list { display: flex; flex-direction: column; gap: 8px; }
 .cond-row { display: flex; align-items: center; gap: 8px; background: var(--card-background-color, #fff); border-radius: 4px; padding: 8px 10px; border: 1px solid var(--divider-color, #e0e0e0); }
 
 /* Action rows */
 .action-card { border: 1px solid var(--divider-color, #e0e0e0); border-radius: 6px; overflow: visible; margin-bottom: 4px; }
-.action-card-header { padding: 10px 14px; background: var(--secondary-background-color, #f5f5f5); display: flex; align-items: center; gap: 10px; }
-.action-number { font-size: 12px; font-weight: 700; color: var(--secondary-text-color); min-width: 20px; }
+.action-card-header { padding: 10px 14px; background: var(--secondary-background-color, #f5f5f5); display: flex; align-items: center; gap: 8px; }
+.action-card-header-left { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; cursor: pointer; }
+.action-number { font-size: 12px; font-weight: 700; color: var(--secondary-text-color); min-width: 24px; flex-shrink: 0; }
+.action-card-summary { font-size: 13px; color: var(--secondary-text-color); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; display: none; }
+.action-card.collapsed .action-card-summary { display: inline; }
+.action-card.collapsed .action-card-body { display: none; }
 .action-card-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+
+/* Collapse chevron */
+.btn-collapse { background: transparent; border: none; padding: 2px 5px; cursor: pointer; color: var(--secondary-text-color); font-size: 18px; border-radius: 4px; line-height: 1; flex-shrink: 0; }
+.btn-collapse:hover { background: rgba(0,0,0,.06); color: var(--primary-color, #03a9f4); }
+
+/* Reorder buttons */
+.btn-order { background: transparent; border: none; padding: 2px 5px; cursor: pointer; color: var(--secondary-text-color); font-size: 18px; font-weight: 700; border-radius: 4px; line-height: 1; flex-shrink: 0; }
+.btn-order:hover:not(:disabled) { background: rgba(0,0,0,.06); color: var(--primary-color, #03a9f4); }
+.btn-order:disabled { opacity: .25; cursor: default; }
+.order-btns { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
 
 /* Form elements */
 select, input[type=text], textarea {
@@ -406,9 +422,10 @@ function readDataRows(container) {
 // ---------------------------------------------------------------------------
 // Condition row
 // ---------------------------------------------------------------------------
-function makeCondRow(cond, entityList = []) {
+function makeCondRow(cond, entityList = [], orderVal = 0) {
   const row = document.createElement("div");
   row.className = "cond-row";
+  row.dataset.order = String(orderVal);
 
   const typeEl = document.createElement("select");
   typeEl.className = "cond-type-sel";
@@ -432,12 +449,20 @@ function makeCondRow(cond, entityList = []) {
   stateEl.type = "text"; stateEl.placeholder = "état attendu"; stateEl.value = cond.state || "";
   stateEl.style.width = "120px"; stateEl.style.flexShrink = "0";
 
+  const orderBtns = document.createElement("div");
+  orderBtns.className = "order-btns";
+  const upBtn = document.createElement("button");
+  upBtn.type = "button"; upBtn.className = "btn-order btn-order-up"; upBtn.textContent = "↑"; upBtn.title = "Monter";
+  const downBtn = document.createElement("button");
+  downBtn.type = "button"; downBtn.className = "btn-order btn-order-down"; downBtn.textContent = "↓"; downBtn.title = "Descendre";
+  orderBtns.append(upBtn, downBtn);
+
   const del = document.createElement("button");
   del.type = "button";
-  del.className = "btn-icon"; del.textContent = "✕";
-  del.onclick = () => row.remove();
+  del.className = "btn-icon btn-delete-cond"; del.textContent = "✕";
+  // .remove() / reorder side-effects are wired from makePhaseBlock.
 
-  row.append(typeEl, entityWrapper, stateEl, del);
+  row.append(orderBtns, typeEl, entityWrapper, stateEl, del);
   return row;
 }
 
@@ -456,7 +481,7 @@ function readCondRow(row) {
 // ---------------------------------------------------------------------------
 // Action card
 // ---------------------------------------------------------------------------
-function makeActionCard(idx, actionData, servicesMap, entityList = [], entityAttrs = {}) {
+function makeActionCard(orderVal, actionData, servicesMap, entityList = [], entityAttrs = {}, startCollapsed = false) {
   // Flat sorted list of "domain.service" strings derived from servicesMap
   const svcList = [];
   for (const [domain, svcs] of Object.entries(servicesMap || {})) {
@@ -468,18 +493,44 @@ function makeActionCard(idx, actionData, servicesMap, entityList = [], entityAtt
 
   const card = document.createElement("div");
   card.className = "action-card";
+  card.dataset.order = String(orderVal);
 
   // Header
   const hdr = document.createElement("div");
   hdr.className = "action-card-header";
+
+  const collapseBtn = document.createElement("button");
+  collapseBtn.type = "button";
+  collapseBtn.className = "btn-collapse";
+  collapseBtn.title = "Déplier / replier";
+  collapseBtn.textContent = "▾";
+
   const numSpan = document.createElement("span");
-  numSpan.className = "action-number"; numSpan.textContent = `#${idx + 1}`;
+  numSpan.className = "action-number"; numSpan.textContent = "#?";
+
+  const summarySpan = document.createElement("span");
+  summarySpan.className = "action-card-summary";
+
+  const headerLeft = document.createElement("div");
+  headerLeft.className = "action-card-header-left";
+  headerLeft.append(collapseBtn, numSpan, summarySpan);
+
+  const orderBtns = document.createElement("div");
+  orderBtns.className = "order-btns";
+  const upBtn = document.createElement("button");
+  upBtn.type = "button"; upBtn.className = "btn-order btn-order-up"; upBtn.textContent = "↑"; upBtn.title = "Monter";
+  const downBtn = document.createElement("button");
+  downBtn.type = "button"; downBtn.className = "btn-order btn-order-down"; downBtn.textContent = "↓"; downBtn.title = "Descendre";
+  orderBtns.append(upBtn, downBtn);
+
   const delBtn = document.createElement("button");
   delBtn.type = "button";
-  delBtn.className = "btn-icon"; delBtn.textContent = "✕ Supprimer l'action";
-  delBtn.style.marginLeft = "auto";
-  delBtn.onclick = () => card.remove();
-  hdr.append(numSpan, delBtn);
+  delBtn.className = "btn-icon btn-delete-action"; delBtn.textContent = "✕ Supprimer l'action";
+  delBtn.style.marginLeft = "8px";
+  // .remove() / reorder side-effects (renumbering, ↑/↓ disabled state) are
+  // wired from makePhaseBlock, which owns the surrounding container.
+
+  hdr.append(orderBtns, headerLeft, delBtn);
 
   const body = document.createElement("div");
   body.className = "action-card-body";
@@ -596,6 +647,13 @@ function makeActionCard(idx, actionData, servicesMap, entityList = [], entityAtt
   targetInput.addEventListener("change", refreshAllRowValueFields);
 
   // ---- Auto-suggest fields on service change ----
+  // Tracks the last "domain.service" string we actually auto-filled for, so
+  // we only clean up/repopulate the data section when the service really
+  // changes to a different one — not on every keystroke while it's still
+  // being typed/incomplete, and not on initial load (where the saved data
+  // is assumed correct as-is).
+  let lastAutoFilledService = actionData.service || "";
+
   function autoFillFields() {
     const svcFull = svcInput.value.trim();
     const dotIdx = svcFull.indexOf(".");
@@ -603,7 +661,24 @@ function makeActionCard(idx, actionData, servicesMap, entityList = [], entityAtt
     const domain = svcFull.substring(0, dotIdx);
     const svcName = svcFull.substring(dotIdx + 1);
     const svcDef = servicesMap && servicesMap[domain] && servicesMap[domain][svcName];
-    if (!svcDef || !svcDef.fields) return;
+    if (!svcDef) return; // unrecognised/incomplete service string — leave existing rows alone
+
+    if (svcFull !== lastAutoFilledService) {
+      // The service genuinely changed (e.g. notify.* -> input_select.*):
+      // drop any data row whose key isn't part of the *new* service's
+      // field schema. Without this, fields like "message"/"title"/"data"
+      // left over from the previous domain just sit there unused (or
+      // worse, get sent as invalid extra data on the new service call).
+      const validKeys = new Set(Object.keys(svcDef.fields || {}));
+      Array.from(dataContainer.querySelectorAll(".data-row")).forEach(row => {
+        const kEl = row.querySelector(".data-key");
+        const key = kEl ? kEl.value.trim() : "";
+        if (key && !validKeys.has(key)) row.remove();
+      });
+    }
+    lastAutoFilledService = svcFull;
+
+    if (!svcDef.fields) return;
 
     const existingKeys = new Set(
       Array.from(dataContainer.querySelectorAll(".data-key")).map(k => k.value.trim()).filter(Boolean)
@@ -622,11 +697,35 @@ function makeActionCard(idx, actionData, servicesMap, entityList = [], entityAtt
     }
   }
 
-  svcInput.addEventListener("change", () => {
+  // Listen on both "input" (live, while typing) and "change" (blur/explicit
+  // pick) so narrowing the entity list, auto-filling fields, AND refreshing
+  // already-existing rows' value dropdowns all happen immediately when the
+  // domain/service changes — previously only "change" was handled and
+  // refreshAllRowValueFields() was never called here, which is exactly why
+  // selecting a new domain left stale option values until the target entity
+  // field was separately re-touched.
+  function onServiceChanged() {
     setTargetOptions(entityOptionsForCurrentService());
     autoFillFields();
-  });
+    refreshAllRowValueFields();
+  }
+  svcInput.addEventListener("input", onServiceChanged);
+  svcInput.addEventListener("change", onServiceChanged);
   if (actionData.service && servicesMap) autoFillFields();
+
+  // ---- Collapse / expand ----
+  function updateSummary() {
+    const svc = svcInput.value.trim() || "(service non défini)";
+    const tgt = targetInput.value.trim() || "(cible non définie)";
+    summarySpan.textContent = `${svc} → ${tgt}`;
+  }
+  function setCollapsed(collapsed) {
+    card.classList.toggle("collapsed", collapsed);
+    collapseBtn.textContent = collapsed ? "▸" : "▾";
+    if (collapsed) updateSummary();
+  }
+  headerLeft.onclick = () => setCollapsed(!card.classList.contains("collapsed"));
+  setCollapsed(startCollapsed);
 
   card.append(hdr, body);
   return card;
@@ -650,6 +749,73 @@ function readActionCard(card) {
 // ---------------------------------------------------------------------------
 // Phase block (on_start or on_stop)
 // ---------------------------------------------------------------------------
+// Re-sorts a reorderable list's DOM children so the most-recently-created
+// (or most-recently-moved) item is visually on top — purely a display
+// convenience — while each element's dataset.order (the value actually used
+// to determine save/execution order in readPhaseBlock) is left untouched
+// except by an explicit ↑/↓ swap. Also recomputes the "#N" badge for action
+// cards (true ascending order, independent of visual position) and disables
+// the ↑/↓ buttons at whichever ends of the *visual* list they'd no longer
+// have an effect.
+function renumberAndSort(container, selector, hasNumber = false) {
+  const items = Array.from(container.querySelectorAll(selector));
+  items.sort((a, b) => Number(b.dataset.order) - Number(a.dataset.order)); // newest/highest order first (top)
+  items.forEach(el => container.appendChild(el));
+
+  if (hasNumber) {
+    const ascending = items.slice().sort((a, b) => Number(a.dataset.order) - Number(b.dataset.order));
+    ascending.forEach((el, i) => {
+      const numEl = el.querySelector(".action-number");
+      if (numEl) numEl.textContent = `#${i + 1}`;
+    });
+  }
+
+  items.forEach((el, i) => {
+    const upBtn = el.querySelector(".btn-order-up");
+    const downBtn = el.querySelector(".btn-order-down");
+    if (upBtn) upBtn.disabled = i === 0;
+    if (downBtn) downBtn.disabled = i === items.length - 1;
+  });
+}
+
+// Wires the ↑ / ↓ / ✕ buttons of a single reorderable item (an action-card
+// or a cond-row) once it has been appended into its container. Swapping
+// dataset.order between visual neighbours is what actually changes the
+// real/save order — see readPhaseBlock, which always reads items sorted by
+// dataset.order ascending, never by raw DOM position.
+function wireReorderableItem(el, container, selector, { hasNumber = false, deleteSelector } = {}) {
+  const upBtn = el.querySelector(".btn-order-up");
+  const downBtn = el.querySelector(".btn-order-down");
+  const delBtn = deleteSelector ? el.querySelector(deleteSelector) : null;
+
+  function swapWith(otherIdx, items, idx) {
+    const other = items[otherIdx];
+    const tmp = el.dataset.order;
+    el.dataset.order = other.dataset.order;
+    other.dataset.order = tmp;
+    renumberAndSort(container, selector, hasNumber);
+  }
+
+  if (upBtn) upBtn.onclick = () => {
+    const items = Array.from(container.querySelectorAll(selector))
+      .sort((a, b) => Number(b.dataset.order) - Number(a.dataset.order));
+    const idx = items.indexOf(el);
+    if (idx <= 0) return;
+    swapWith(idx - 1, items, idx);
+  };
+  if (downBtn) downBtn.onclick = () => {
+    const items = Array.from(container.querySelectorAll(selector))
+      .sort((a, b) => Number(b.dataset.order) - Number(a.dataset.order));
+    const idx = items.indexOf(el);
+    if (idx === -1 || idx >= items.length - 1) return;
+    swapWith(idx + 1, items, idx);
+  };
+  if (delBtn) delBtn.onclick = () => {
+    el.remove();
+    renumberAndSort(container, selector, hasNumber);
+  };
+}
+
 function makePhaseBlock(phase, phaseData, servicesMap, entityList = [], entityAttrs = {}) {
   const isStart = phase === "on_start";
   const block = document.createElement("div");
@@ -673,20 +839,54 @@ function makePhaseBlock(phase, phaseData, servicesMap, entityList = [], entityAt
   condBlock.className = "cond-block";
   const condTitleRow = document.createElement("div");
   condTitleRow.className = "cond-block-title";
-  condTitleRow.innerHTML = "<span>🔎 Conditions (toutes doivent être vraies)</span>";
+
+  const condCollapseBtn = document.createElement("button");
+  condCollapseBtn.type = "button";
+  condCollapseBtn.className = "btn-collapse";
+  condCollapseBtn.title = "Déplier / replier";
+
+  const condTitleLeft = document.createElement("div");
+  condTitleLeft.className = "cond-block-title-left";
+  const condTitleText = document.createElement("span");
+  condTitleText.textContent = "🔎 Conditions (toutes doivent être vraies)";
+  condTitleLeft.append(condCollapseBtn, condTitleText);
+
   const addCondBtn = document.createElement("button");
   addCondBtn.type = "button";
   addCondBtn.className = "btn-add"; addCondBtn.textContent = "+ Condition";
-  condTitleRow.appendChild(addCondBtn);
+  condTitleRow.append(condTitleLeft, addCondBtn);
+
   const condList = document.createElement("div");
   condList.className = "cond-list";
+
+  function setCondCollapsed(collapsed) {
+    condBlock.classList.toggle("collapsed", collapsed);
+    condCollapseBtn.textContent = collapsed ? "▸" : "▾";
+  }
+  condTitleLeft.onclick = () => setCondCollapsed(!condBlock.classList.contains("collapsed"));
 
   let existingConds = [];
   if (phaseData && typeof phaseData === "object" && !Array.isArray(phaseData)) {
     existingConds = phaseData.conditions || [];
   }
-  existingConds.forEach(c => condList.appendChild(makeCondRow(c, entityList)));
-  addCondBtn.onclick = () => condList.appendChild(makeCondRow({}, entityList));
+  let nextCondOrder = existingConds.length;
+  existingConds.forEach((c, i) => {
+    const row = makeCondRow(c, entityList, i);
+    condList.appendChild(row);
+    wireReorderableItem(row, condList, ".cond-row", { deleteSelector: ".btn-delete-cond" });
+  });
+  renumberAndSort(condList, ".cond-row");
+  // Pre-existing conditions start collapsed (reduce clutter on an already
+  // configured event); a brand-new, empty conditions list starts expanded.
+  setCondCollapsed(existingConds.length > 0);
+
+  addCondBtn.onclick = () => {
+    const row = makeCondRow({}, entityList, nextCondOrder++);
+    condList.appendChild(row);
+    wireReorderableItem(row, condList, ".cond-row", { deleteSelector: ".btn-delete-cond" });
+    renumberAndSort(condList, ".cond-row");
+    setCondCollapsed(false); // always reveal the list so the new row is visible
+  };
   condBlock.append(condTitleRow, condList);
 
   // --- Actions ---
@@ -698,9 +898,16 @@ function makePhaseBlock(phase, phaseData, servicesMap, entityList = [], entityAt
   if (Array.isArray(phaseData)) existingActions = phaseData;
   else if (phaseData && typeof phaseData === "object") existingActions = phaseData.actions || [];
 
+  let nextActionOrder = existingActions.length;
   existingActions.forEach((a, i) => {
-    actionsContainer.appendChild(makeActionCard(i, a, servicesMap, entityList, entityAttrs));
+    // Pre-existing actions start collapsed (one-line summary) so a long,
+    // already-configured list stays scannable; only freshly added cards
+    // start expanded for immediate editing.
+    const card = makeActionCard(i, a, servicesMap, entityList, entityAttrs, /* startCollapsed */ true);
+    actionsContainer.appendChild(card);
+    wireReorderableItem(card, actionsContainer, ".action-card", { hasNumber: true, deleteSelector: ".btn-delete-action" });
   });
+  renumberAndSort(actionsContainer, ".action-card", true);
 
   const actTitleRow = document.createElement("div");
   actTitleRow.style.cssText = "font-size:13px;font-weight:600;color:var(--secondary-text-color);display:flex;align-items:center;justify-content:space-between;margin-top:4px;";
@@ -709,8 +916,13 @@ function makePhaseBlock(phase, phaseData, servicesMap, entityList = [], entityAt
   addActionBtn.type = "button";
   addActionBtn.className = "btn-add"; addActionBtn.textContent = "+ Ajouter un appel de service";
   addActionBtn.onclick = () => {
-    const idx = actionsContainer.querySelectorAll(".action-card").length;
-    actionsContainer.appendChild(makeActionCard(idx, {}, servicesMap, entityList, entityAttrs));
+    // New card: real/save order = appended after every existing one
+    // (creation order preserved), but it renders at the top of the visual
+    // list (newest first) and starts expanded for immediate editing.
+    const card = makeActionCard(nextActionOrder++, {}, servicesMap, entityList, entityAttrs, /* startCollapsed */ false);
+    actionsContainer.appendChild(card);
+    wireReorderableItem(card, actionsContainer, ".action-card", { hasNumber: true, deleteSelector: ".btn-delete-action" });
+    renumberAndSort(actionsContainer, ".action-card", true);
   };
   actTitleRow.appendChild(addActionBtn);
 
@@ -720,11 +932,18 @@ function makePhaseBlock(phase, phaseData, servicesMap, entityList = [], entityAt
 }
 
 function readPhaseBlock(block) {
-  const condRows = block.querySelectorAll(".cond-list .cond-row");
-  const conditions = Array.from(condRows).map(r => readCondRow(r)).filter(c => c.entity_id);
+  // Always read in *true* (saved/execution) order = ascending dataset.order
+  // — independent of however the items are currently arranged on screen.
+  // This stays equal to creation order unless the user has explicitly used
+  // the ↑/↓ buttons on a given list, at which point the swapped order
+  // values are exactly what gets read here.
+  const condRows = Array.from(block.querySelectorAll(".cond-list .cond-row"))
+    .sort((a, b) => Number(a.dataset.order) - Number(b.dataset.order));
+  const conditions = condRows.map(r => readCondRow(r)).filter(c => c.entity_id);
 
-  const actionCards = block.querySelectorAll(".action-card");
-  const actions = Array.from(actionCards).map(c => readActionCard(c)).filter(a => a.service);
+  const actionCards = Array.from(block.querySelectorAll(".action-card"))
+    .sort((a, b) => Number(a.dataset.order) - Number(b.dataset.order));
+  const actions = actionCards.map(c => readActionCard(c)).filter(a => a.service);
 
   if (actions.length === 0 && conditions.length === 0) return null;
   if (conditions.length === 0) return actions;
