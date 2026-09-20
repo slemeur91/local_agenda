@@ -84,7 +84,7 @@ async def ws_get_events(
         connection.send_error(msg["id"], "not_found", "Calendar entry not found")
         return
 
-    cal: Calendar = store.get_calendar()
+    cal: Calendar = store.get_calendar_for_read()
     events = []
     for component in cal.walk("VEVENT"):
         # Only return master VEVENTs (no RECURRENCE-ID overrides)

@@ -121,10 +121,15 @@ async def _check_actions(hass: HomeAssistant, entry: ConfigEntry) -> None:
     now = dt_util.utcnow()
     window = timedelta(seconds=22)
 
-    # Per-entry deduplication set (lives for the duration of the HA session)
+    # Per-entry deduplication set (lives for the duration of the HA session).
+    # Purge keys older than 10 minutes each tick to prevent unbounded growth
+    # on long-running HA instances with many recurring events.  10 minutes is
+    # safely above the 22-second firing window, so no valid key is evicted.
     fired: set[str] = hass.data[DOMAIN].setdefault(
         entry.entry_id + "_fired", set()
     )
+    cutoff = (now - timedelta(minutes=10)).isoformat()
+    fired -= {k for k in fired if k.split(":")[2] < cutoff}
     entities = hass.data[DOMAIN].get(entry.entry_id, {}).get("entities", [])
 
     for entity in entities:
