@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import logging
 import uuid
-from datetime import date, datetime, timedelta
+from collections import defaultdict
+from datetime import date, datetime, timedelta, timezone
 from typing import Any
 
 import recurring_ical_events
-from icalendar import Calendar, Event, vText
+from icalendar import Calendar, Event, vDate, vDatetime, vRecur
 from homeassistant.components.calendar import (
     CalendarEntity,
     CalendarEntityFeature,
@@ -15,6 +16,7 @@ from homeassistant.components.calendar import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.util import dt as dt_util
 
@@ -84,12 +86,22 @@ class LocalAgendaEntity(CalendarEntity):
         await self._refresh_next_event()
 
     async def _refresh_next_event(self) -> None:
-        """Recompute the next upcoming event in the executor (non-blocking)."""
+        """Recompute the next upcoming event in the executor (non-blocking).
+
+        Look a week ahead first and widen only when nothing is found: the
+        earliest event of a short window is also the earliest of a longer
+        one, and expanding a whole year of recurrences on every refresh is
+        wasted work for a calendar that has something planned this week.
+        """
         now = dt_util.utcnow()
-        events = await self._hass.async_add_executor_job(
-            self._expand_events, now, now + timedelta(days=365)
-        )
-        self._next_event = events[0] if events else None
+        for days in _NEXT_EVENT_HORIZONS_DAYS:
+            events = await self._hass.async_add_executor_job(
+                self._expand_events, now, now + timedelta(days=days)
+            )
+            if events:
+                self._next_event = events[0]
+                return
+        self._next_event = None
 
     def _notify_panel_updated(self) -> None:
         """Fire a bus event so the Local Agenda panel can refresh its event
@@ -116,84 +128,103 @@ class LocalAgendaEntity(CalendarEntity):
     def _expand_events(
         self, start_date: datetime, end_date: datetime
     ) -> list[CalendarEvent]:
-        """Expand all events in range, grouping VEVENTs by UID.
+        """Expand all events in range.
 
-        Grouping master + RECURRENCE-ID exception VEVENTs together lets
-        recurring_ical_events apply overrides correctly (RFC 5545 §3.8.4.4).
-        Processing each UID group independently ensures a single malformed
-        event never blocks the others from appearing.
+        The whole calendar is expanded in one pass.  Only if that fails —
+        one malformed event is enough — each UID group (master VEVENT plus
+        its RECURRENCE-ID exceptions, RFC 5545 §3.8.4.4) is expanded on its
+        own, so that a single bad event never hides the others.
         """
-        from collections import defaultdict
-
         cal = _safe_calendar(self._store.get_calendar_for_read())
 
-        # Collect non-VEVENT components once (VTIMEZONE, etc.) — shared base
-        base_subcomponents = [
-            c for c in cal.subcomponents if c.name != "VEVENT"
-        ]
-
-        # Group VEVENTs by UID so that RECURRENCE-ID exceptions are always
-        # processed alongside their master event.
+        # Group VEVENTs by UID, and remember the RRULE of each master.
+        # recurring_ical_events does NOT copy RRULE onto the occurrences it
+        # returns, so it is carried forward for CalendarEvent.rrule (the HA
+        # dialog would otherwise show every recurring event as "never").
         events_by_uid: dict[str, list] = defaultdict(list)
+        rrule_by_uid: dict[str, str] = {}
         for vevent in cal.subcomponents:
-            if vevent.name == "VEVENT":
-                uid = str(vevent.get("UID", vevent.get("uid", "_no_uid_")))
-                events_by_uid[uid].append(vevent)
+            if vevent.name != "VEVENT":
+                continue
+            uid = str(vevent.get("UID", "_no_uid_"))
+            events_by_uid[uid].append(vevent)
+            if vevent.get("RECURRENCE-ID") is None:
+                rrule_str = _rrule_to_str(vevent.get("RRULE"))
+                if rrule_str is not None:
+                    rrule_by_uid[uid] = rrule_str
 
-        events: list[CalendarEvent] = []
+        def _convert(occurrences: list) -> list[CalendarEvent]:
+            converted = []
+            for occ in occurrences:
+                uid = str(occ.get("UID", "_no_uid_"))
+                evt = _component_to_event(occ, rrule_override=rrule_by_uid.get(uid))
+                if evt is not None:
+                    converted.append(evt)
+            return converted
 
-        for uid, vevents in events_by_uid.items():
-            # Extract RRULE from the master VEVENT (no RECURRENCE-ID).
-            # recurring_ical_events v2.x does NOT copy RRULE onto occurrence
-            # objects it returns, so we carry it forward so that
-            # CalendarEvent.rrule is set and the HA dialog shows the real rule.
-            master_vevent = next(
-                (v for v in vevents if v.get("RECURRENCE-ID") is None), None
+        try:
+            events = _convert(
+                recurring_ical_events.of(cal, components=["VEVENT"]).between(
+                    start_date, end_date
+                )
             )
-            master_rrule_str: str | None = None
-            if master_vevent is not None:
-                rrule_prop = master_vevent.get("RRULE")
-                if rrule_prop is not None:
-                    try:
-                        master_rrule_str = rrule_prop.to_ical().decode("utf-8")
-                    except Exception:
-                        pass
+        except Exception as err:
+            _LOGGER.debug(
+                "local_agenda: whole-calendar expansion failed (%s) — "
+                "expanding each event separately", err,
+            )
+            events = self._expand_events_by_uid(
+                cal, events_by_uid, _convert, start_date, end_date
+            )
 
-            # Build a mini calendar with ALL VEVENTs for this UID group.
-            # This is required for recurring_ical_events to apply
-            # RECURRENCE-ID overrides instead of returning them as standalone
-            # events.
+        events.sort(key=lambda e: _as_utc(e.start))
+        return events
+
+    @staticmethod
+    def _expand_events_by_uid(
+        cal: Calendar,
+        events_by_uid: dict[str, list],
+        convert: Any,
+        start_date: datetime,
+        end_date: datetime,
+    ) -> list[CalendarEvent]:
+        """Expand each UID group in its own mini calendar (fallback path)."""
+        # Non-VEVENT components (VTIMEZONE, etc.) are shared by every group.
+        base_subcomponents = [c for c in cal.subcomponents if c.name != "VEVENT"]
+        events: list[CalendarEvent] = []
+        for uid, vevents in events_by_uid.items():
             mini = Calendar()
             for key in cal:
                 mini[key] = cal[key]
             mini.subcomponents = base_subcomponents + vevents
-
             try:
-                occ_list = recurring_ical_events.of(
-                    mini, components=["VEVENT"]
-                ).between(start_date, end_date)
-                for occ in occ_list:
-                    evt = _component_to_event(occ, rrule_override=master_rrule_str)
-                    if evt is not None:
-                        events.append(evt)
+                events.extend(
+                    convert(
+                        recurring_ical_events.of(mini, components=["VEVENT"]).between(
+                            start_date, end_date
+                        )
+                    )
+                )
             except Exception as err:
                 _LOGGER.warning(
                     "local_agenda: skipping uid=%s (%s): %s",
-                    uid,
-                    master_vevent.get("SUMMARY", "?") if master_vevent else "?",
-                    err,
+                    uid, vevents[0].get("SUMMARY", "?"), err,
                 )
-
-        events.sort(key=lambda e: _as_utc(e.start))
         return events
 
     # ------------------------------------------------------------------
     # CRUD
     # ------------------------------------------------------------------
 
+    async def _async_saved(self) -> None:
+        """Persist the calendar and publish the change."""
+        await self._store.async_save(self._hass)
+        await self._refresh_next_event()
+        self.async_write_ha_state()
+        self._notify_panel_updated()
+
     async def async_create_event(self, **kwargs: Any) -> None:
         """Create a new event (called by HA frontend)."""
-        from icalendar import vRecur
         _LOGGER.debug("local_agenda: create_event kwargs keys=%s", list(kwargs.keys()))
         # Normalise start/end — HA may use dtstart OR start_date_time/start_date
         start = (kwargs.get("dtstart") or kwargs.get("start_date_time")
@@ -201,14 +232,14 @@ class LocalAgendaEntity(CalendarEntity):
         end   = (kwargs.get("dtend")   or kwargs.get("end_date_time")
                  or kwargs.get("end_date") or start)
         if start is None:
-            _LOGGER.warning(
-                "local_agenda: create_event called with no start date/time "
-                "(kwargs=%s) — ignoring", list(kwargs.keys())
+            raise HomeAssistantError(
+                "local_agenda: cannot create an event without a start date/time"
             )
-            return
-        cal = self._store.get_calendar()
+        rrule = _parse_rrule(kwargs.get("rrule"))
+
         component = Event()
         component.add("uid", str(uuid.uuid4()))
+        component.add("dtstamp", dt_util.utcnow())
         component.add("summary", kwargs.get("summary", ""))
         component.add("dtstart", start)
         component.add("dtend", end)
@@ -216,17 +247,10 @@ class LocalAgendaEntity(CalendarEntity):
             component.add("description", desc)
         if loc := kwargs.get("location"):
             component.add("location", loc)
-        if rrule := kwargs.get("rrule"):
-            _LOGGER.debug("local_agenda: create_event rrule=%s", rrule)
-            try:
-                component.add("rrule", vRecur.from_ical(rrule))
-            except Exception as err:
-                _LOGGER.warning("local_agenda: could not parse rrule '%s': %s", rrule, err)
-        cal.add_component(component)
-        await self._store.async_save(self._hass)
-        await self._refresh_next_event()
-        self.async_write_ha_state()
-        self._notify_panel_updated()
+        if rrule is not None:
+            component.add("rrule", rrule)
+        self._store.get_calendar().add_component(component)
+        await self._async_saved()
 
     async def async_delete_event(
         self,
@@ -240,178 +264,48 @@ class LocalAgendaEntity(CalendarEntity):
         - recurrence_id set, range THISANDFUTURE → truncate series at that date.
         - recurrence_id set, no range (THIS)     → exclude that occurrence via EXDATE.
         """
-        from icalendar import vDatetime, vDate
-        import datetime as _dt
-
         _LOGGER.debug(
             "local_agenda: delete_event uid=%s recurrence_id=%s range=%s",
             uid, recurrence_id, recurrence_range,
         )
         cal = self._store.get_calendar()
+        master = _find_master(cal, uid)
+        if master is None and not _has_uid(cal, uid):
+            raise HomeAssistantError(f"local_agenda: event {uid} not found")
 
-        if recurrence_id is None:
-            # Delete the whole VEVENT series (master + all RECURRENCE-ID exceptions)
-            before = len(cal.subcomponents)
-            cal.subcomponents = [
-                c for c in cal.subcomponents
-                if not (c.name == "VEVENT" and str(c.get("uid", "")) == uid)
-            ]
-            _LOGGER.debug(
-                "local_agenda: delete_event ALL — removed %d component(s)",
-                before - len(cal.subcomponents),
-            )
+        # HA's native calendar UI sends a recurrence_id (matching DTSTART)
+        # even when deleting a perfectly ordinary, non-recurring event.  With
+        # no RRULE there is no series to exclude an occurrence from — an
+        # EXDATE would be a silent no-op and the event would keep appearing —
+        # so the whole VEVENT is deleted, exactly as if recurrence_id were None.
+        if recurrence_id is None or (
+            master is not None and master.get("rrule") is None
+        ):
+            _remove_uid(cal, uid)
         else:
-            # Parse recurrence_id to a date/datetime
-            rec_dt = None
-            try:
-                rec_dt = vDatetime.from_ical(recurrence_id)
-            except Exception:
-                try:
-                    rec_dt = vDate.from_ical(recurrence_id)
-                except Exception:
-                    pass
-
-            _LOGGER.debug(
-                "local_agenda: delete_event parsed rec_dt=%s", rec_dt
-            )
-
-            # Always operate on the MASTER VEVENT (no RECURRENCE-ID property).
-            # Exceptions (RECURRENCE-ID VEVENTs) share the same uid but must not
-            # be confused with the master when modifying RRULE or EXDATE.
-            master_component = None
-            for component in cal.walk("VEVENT"):
-                if (str(component.get("uid", "")) == uid
-                        and component.get("RECURRENCE-ID") is None):
-                    master_component = component
-                    break
-
-            # HA's native calendar UI sends a recurrence_id (matching DTSTART)
-            # even when deleting a perfectly ordinary, non-recurring event —
-            # not just for genuine occurrences of a recurring series. If the
-            # master VEVENT has no RRULE at all, there is no series to
-            # "exclude an occurrence from": adding an EXDATE in that case is
-            # a silent no-op (EXDATE only suppresses RRULE-generated
-            # occurrences), so the event would wrongly keep appearing
-            # forever. Detect that case and fall back to deleting the whole
-            # VEVENT, exactly as if recurrence_id had been None.
-            if master_component is not None and master_component.get("rrule") is None:
-                before = len(cal.subcomponents)
-                cal.subcomponents = [
-                    c for c in cal.subcomponents
-                    if not (c.name == "VEVENT" and str(c.get("uid", "")) == uid)
-                ]
-                _LOGGER.debug(
-                    "local_agenda: delete_event — recurrence_id given but "
-                    "master has no RRULE (non-recurring event); deleted "
-                    "whole event, removed %d component(s)",
-                    before - len(cal.subcomponents),
+            rec_dt = _recurrence_dt(recurrence_id, master)
+            if rec_dt is None:
+                raise HomeAssistantError(
+                    f"local_agenda: unreadable recurrence id '{recurrence_id}'"
                 )
-            elif master_component is not None:
-                if recurrence_range == "THISANDFUTURE" and rec_dt is not None:
-                    # Truncate: set UNTIL to the moment before this occurrence.
-                    # Edge case: if rec_dt <= DTSTART the RRULE would still let
-                    # recurring_ical_events return DTSTART as a standalone
-                    # occurrence.  In that case we must delete the whole series.
-                    rrule = master_component.get("rrule")
-                    if rrule:
-                        if isinstance(rec_dt, _dt.datetime):
-                            until = rec_dt - _dt.timedelta(seconds=1)
-                        else:
-                            until = rec_dt - _dt.timedelta(days=1)
-
-                        dtstart_prop = master_component.get("dtstart")
-                        dtstart_dt = dtstart_prop.dt if dtstart_prop is not None else None
-
-                        # Normalise types for comparison: date → datetime
-                        if (dtstart_dt is not None
-                                and isinstance(until, _dt.datetime)
-                                and isinstance(dtstart_dt, _dt.date)
-                                and not isinstance(dtstart_dt, _dt.datetime)):
-                            dtstart_dt = _dt.datetime(
-                                dtstart_dt.year, dtstart_dt.month, dtstart_dt.day
-                            )
-
-                        # Normalise timezone awareness: strip tz from the aware
-                        # side if one datetime is naive and the other is aware.
-                        # (HA 2026.4 sends recurrence_id without timezone info
-                        #  while DTSTART in the .ics may carry TZID.)
-                        if (dtstart_dt is not None
-                                and isinstance(until, _dt.datetime)
-                                and isinstance(dtstart_dt, _dt.datetime)):
-                            if until.tzinfo is None and dtstart_dt.tzinfo is not None:
-                                dtstart_dt = dtstart_dt.replace(tzinfo=None)
-                            elif until.tzinfo is not None and dtstart_dt.tzinfo is None:
-                                until = until.replace(tzinfo=None)
-
-                        if dtstart_dt is not None and until < dtstart_dt:
-                            # UNTIL would be before DTSTART → delete whole series.
-                            _LOGGER.debug(
-                                "local_agenda: delete_event THISANDFUTURE — "
-                                "until=%s < dtstart=%s, deleting whole series",
-                                until, dtstart_dt,
-                            )
-                            cal.subcomponents = [
-                                c for c in cal.subcomponents
-                                if not (c.name == "VEVENT"
-                                        and str(c.get("uid", "")) == uid)
-                            ]
-                        else:
-                            rrule["UNTIL"] = [until]
-                            rrule.pop("COUNT", None)
-                            _LOGGER.debug(
-                                "local_agenda: delete_event THISANDFUTURE — "
-                                "set UNTIL=%s", until,
-                            )
-                else:
-                    # Exclude just this occurrence via EXDATE on the master.
-                    # We always add a new EXDATE property rather than trying to
-                    # merge into an existing one — multiple EXDATE entries are
-                    # perfectly valid per RFC 5545, and this avoids the
-                    # icalendar 5.x vDDDLists type error that occurs when
-                    # the component.add() helper receives a non-datetime value.
-                    if rec_dt is not None:
-                        master_component.add("exdate", rec_dt)
-                        _LOGGER.debug(
-                            "local_agenda: delete_event THIS — added EXDATE %s", rec_dt
-                        )
-
-            # For single-occurrence deletes: also remove any RECURRENCE-ID
-            # override VEVENT that matches this date (the "doublon" case).
-            # Without this step the exception VEVENT persists in the file and
-            # keeps appearing in the calendar even after the EXDATE is set.
-            if recurrence_range != "THISANDFUTURE" and rec_dt is not None:
-                def _is_matching_override(c: Any) -> bool:
-                    if c.name != "VEVENT" or str(c.get("uid", "")) != uid:
-                        return False
-                    rid = c.get("RECURRENCE-ID")
-                    if rid is None:
-                        return False
-                    try:
-                        rid_dt = rid.dt
-                        cmp_dt = rec_dt
-                        if (isinstance(rid_dt, _dt.datetime)
-                                and isinstance(cmp_dt, _dt.datetime)):
-                            if rid_dt.tzinfo is not None and cmp_dt.tzinfo is None:
-                                rid_dt = rid_dt.replace(tzinfo=None)
-                            elif rid_dt.tzinfo is None and cmp_dt.tzinfo is not None:
-                                cmp_dt = cmp_dt.replace(tzinfo=None)
-                        return rid_dt == cmp_dt
-                    except Exception:
-                        return False
-
-                before_exc = len(cal.subcomponents)
-                cal.subcomponents = [
-                    c for c in cal.subcomponents if not _is_matching_override(c)
-                ]
-                _LOGGER.debug(
-                    "local_agenda: delete_event THIS — removed %d RECURRENCE-ID override(s)",
-                    before_exc - len(cal.subcomponents),
+            if recurrence_range == "THISANDFUTURE":
+                if master is not None:
+                    _truncate_series(cal, master, uid, rec_dt)
+            else:
+                # Exclude just this occurrence via EXDATE on the master.  A
+                # new EXDATE property is always added rather than merged into
+                # an existing one — several EXDATE lines are valid per
+                # RFC 5545.
+                if master is not None:
+                    master.add("exdate", rec_dt)
+                # Also remove the RECURRENCE-ID override of that occurrence,
+                # if any: it would otherwise survive in the file and keep
+                # appearing in the calendar despite the EXDATE.
+                _remove_overrides(
+                    cal, uid, lambda rid: _same_moment(rid, rec_dt)
                 )
 
-        await self._store.async_save(self._hass)
-        await self._refresh_next_event()
-        self.async_write_ha_state()
-        self._notify_panel_updated()
+        await self._async_saved()
 
     async def async_update_event(
         self,
@@ -421,541 +315,411 @@ class LocalAgendaEntity(CalendarEntity):
         recurrence_range: str | None = None,
     ) -> None:
         """Update an event or one occurrence of a recurring series."""
-        from icalendar import vRecur, vDatetime, vDate
-        import datetime as _dt
-
         _LOGGER.debug(
             "local_agenda: update_event uid=%s recurrence_id=%s range=%s event_keys=%s",
             uid, recurrence_id, recurrence_range, list(event.keys()),
         )
-
-        editing_whole_series = recurrence_id is None
-        # THISANDFUTURE: recurrence_id is set but the edit applies to this
-        # occurrence AND all subsequent ones — must be handled separately.
-        editing_this_and_future = (
-            recurrence_range == "THISANDFUTURE" and not editing_whole_series
-        )
+        cal = self._store.get_calendar()
+        master = _find_master(cal, uid)
+        if master is None:
+            raise HomeAssistantError(f"local_agenda: event {uid} not found")
 
         # Normalise start/end — HA may send dtstart or start_date_time/start_date
         new_start = (event.get("dtstart") or event.get("start_date_time")
                      or event.get("start_date"))
         new_end   = (event.get("dtend")   or event.get("end_date_time")
                      or event.get("end_date"))
+        # Validate everything before touching the calendar, so that a
+        # rejected edit leaves it exactly as it was.
+        new_rrule = _parse_rrule(event.get("rrule"))
 
-        _LOGGER.debug(
-            "local_agenda: update_event editing_whole_series=%s new_start=%s new_end=%s rrule=%s",
-            editing_whole_series, new_start, new_end, event.get("rrule"),
-        )
-
-        cal = self._store.get_calendar()
-
-        # ------------------------------------------------------------------ #
-        # THISANDFUTURE: truncate original series + create a new one          #
-        # RFC 5545 §3.8.4.4 RANGE=THISANDFUTURE                              #
-        # ------------------------------------------------------------------ #
-        if editing_this_and_future:
-            rec_dt = None
-            try:
-                rec_dt = vDatetime.from_ical(recurrence_id)
-            except Exception:
-                try:
-                    rec_dt = vDate.from_ical(recurrence_id)
-                except Exception:
-                    pass
-
-            _LOGGER.debug(
-                "local_agenda: THISANDFUTURE update — rec_dt=%s", rec_dt
-            )
-
-            # Find the master VEVENT (no RECURRENCE-ID property)
-            master_taf: Event | None = None
-            for _c in cal.walk("VEVENT"):
-                if (str(_c.get("uid", "")) == uid
-                        and _c.get("RECURRENCE-ID") is None):
-                    master_taf = _c
-                    break
-
-            if master_taf is not None and rec_dt is not None and master_taf.get("rrule") is not None:
-                # ---- Step 1: Truncate the original series at rec_dt ----
-                rrule_taf = master_taf.get("rrule")
-                if isinstance(rec_dt, _dt.datetime):
-                    until_taf = rec_dt - _dt.timedelta(seconds=1)
-                else:
-                    until_taf = rec_dt - _dt.timedelta(days=1)
-
-                dtstart_prop_taf = master_taf.get("dtstart")
-                dtstart_dt_taf = dtstart_prop_taf.dt if dtstart_prop_taf is not None else None
-
-                # date → datetime coercion for comparison
-                if (dtstart_dt_taf is not None
-                        and isinstance(until_taf, _dt.datetime)
-                        and isinstance(dtstart_dt_taf, _dt.date)
-                        and not isinstance(dtstart_dt_taf, _dt.datetime)):
-                    dtstart_dt_taf = _dt.datetime(
-                        dtstart_dt_taf.year, dtstart_dt_taf.month, dtstart_dt_taf.day
-                    )
-
-                # Timezone normalization (HA sends naive recurrence_id)
-                if (dtstart_dt_taf is not None
-                        and isinstance(until_taf, _dt.datetime)
-                        and isinstance(dtstart_dt_taf, _dt.datetime)):
-                    if until_taf.tzinfo is None and dtstart_dt_taf.tzinfo is not None:
-                        dtstart_dt_taf = dtstart_dt_taf.replace(tzinfo=None)
-                    elif until_taf.tzinfo is not None and dtstart_dt_taf.tzinfo is None:
-                        until_taf = until_taf.replace(tzinfo=None)
-
-                if dtstart_dt_taf is not None and until_taf < dtstart_dt_taf:
-                    # Editing from the first occurrence → remove whole original series
-                    _LOGGER.debug(
-                        "local_agenda: THISANDFUTURE update — "
-                        "until=%s < dtstart=%s, removing whole original series",
-                        until_taf, dtstart_dt_taf,
-                    )
-                    cal.subcomponents = [
-                        c for c in cal.subcomponents
-                        if not (c.name == "VEVENT" and str(c.get("uid", "")) == uid)
-                    ]
-                else:
-                    rrule_taf["UNTIL"] = [until_taf]
-                    rrule_taf.pop("COUNT", None)
-                    _LOGGER.debug(
-                        "local_agenda: THISANDFUTURE update — "
-                        "original series UNTIL set to %s", until_taf,
-                    )
-                    # Remove RECURRENCE-ID exceptions that fall on or after rec_dt
-                    # (they are now beyond the truncation point)
-                    _rec_dt_for_cmp = rec_dt
-
-                    def _exc_on_or_after(c: Any) -> bool:
-                        rid_prop = c.get("RECURRENCE-ID")
-                        if c.name != "VEVENT" or str(c.get("uid", "")) != uid:
-                            return False
-                        if rid_prop is None:
-                            return False
-                        try:
-                            rid_dt = rid_prop.dt
-                            cmp = _rec_dt_for_cmp
-                            if isinstance(rid_dt, _dt.datetime) and isinstance(cmp, _dt.datetime):
-                                if rid_dt.tzinfo is None and cmp.tzinfo is not None:
-                                    cmp = cmp.replace(tzinfo=None)
-                                elif rid_dt.tzinfo is not None and cmp.tzinfo is None:
-                                    rid_dt = rid_dt.replace(tzinfo=None)
-                            return rid_dt >= cmp
-                        except Exception:
-                            return False
-
-                    before_exc = len(cal.subcomponents)
-                    cal.subcomponents = [
-                        c for c in cal.subcomponents if not _exc_on_or_after(c)
-                    ]
-                    _LOGGER.debug(
-                        "local_agenda: THISANDFUTURE update — removed %d future exception(s)",
-                        before_exc - len(cal.subcomponents),
-                    )
-
-                # ---- Step 2: Create the new event series from rec_dt ----
-                new_series = Event()
-                new_uid = str(uuid.uuid4())
-                new_series.add("uid", new_uid)
-
-                series_start = new_start if new_start is not None else rec_dt
-                new_series.add("dtstart", series_start)
-
-                if new_end is not None:
-                    new_series.add("dtend", new_end)
-                elif new_start is not None:
-                    m_start_p = master_taf.get("dtstart")
-                    m_end_p   = master_taf.get("dtend")
-                    if m_start_p is not None and m_end_p is not None:
-                        try:
-                            new_series.add("dtend", series_start + (m_end_p.dt - m_start_p.dt))
-                        except Exception:
-                            pass
-
-                # RRULE: HA sends the (possibly updated) rule in the event dict
-                incoming_rrule_taf: str | None = event.get("rrule")
-                if incoming_rrule_taf:
-                    try:
-                        new_series.add("rrule", vRecur.from_ical(incoming_rrule_taf))
-                    except Exception as err:
-                        _LOGGER.warning(
-                            "local_agenda: THISANDFUTURE rrule parse error '%s': %s",
-                            incoming_rrule_taf, err,
-                        )
-                else:
-                    # Carry master RRULE (UNTIL/COUNT already stripped above)
-                    master_rrule_taf = master_taf.get("rrule")
-                    if master_rrule_taf is not None:
-                        try:
-                            new_series.add(
-                                "rrule",
-                                vRecur.from_ical(master_rrule_taf.to_ical().decode("utf-8")),
-                            )
-                        except Exception:
-                            pass
-
-                # Text fields: prefer event dict, fall back to master
-                for _field in ("summary", "description", "location"):
-                    _val = event.get(_field)
-                    if _val is not None:
-                        if _val:
-                            new_series.add(_field, _val)
-                    else:
-                        _mval = master_taf.get(_field)
-                        if _mval is not None:
-                            new_series.add(_field, _mval)
-
-                cal.add_component(new_series)
-                _LOGGER.debug(
-                    "local_agenda: THISANDFUTURE update — "
-                    "new series uid=%s dtstart=%s",
-                    new_uid, series_start,
-                )
-
-            else:
-                # No RRULE or missing master/rec_dt — update the event in-place
-                _LOGGER.debug(
-                    "local_agenda: THISANDFUTURE update — no RRULE/master, "
-                    "falling through to in-place edit",
-                )
-                for _c in cal.walk("VEVENT"):
-                    if str(_c.get("uid", "")) != uid:
-                        continue
-                    if "summary" in event:
-                        del _c["summary"]
-                        _c.add("summary", event["summary"])
-                    if "description" in event:
-                        _c.pop("description", None)
-                        if event["description"]:
-                            _c.add("description", event["description"])
-                    if "location" in event:
-                        _c.pop("location", None)
-                        if event["location"]:
-                            _c.add("location", event["location"])
-                    if new_start is not None:
-                        _c.pop("dtstart", None)
-                        _c.add("dtstart", new_start)
-                    if new_end is not None:
-                        _c.pop("dtend", None)
-                        _c.add("dtend", new_end)
-                    break
-
-        # ------------------------------------------------------------------ #
-        # Single-occurrence edit WITH time change                              #
-        # RFC 5545 requires a RECURRENCE-ID override VEVENT for this case.    #
-        # We must NOT modify the master VEVENT's DTSTART/DTEND — that would   #
-        # shift or destroy the whole series.                                   #
-        # ------------------------------------------------------------------ #
-        elif not editing_whole_series and (new_start is not None or new_end is not None):
-            # Parse recurrence_id back to a date/datetime
-            rec_dt = None
-            try:
-                rec_dt = vDatetime.from_ical(recurrence_id)
-            except Exception:
-                try:
-                    rec_dt = vDate.from_ical(recurrence_id)
-                except Exception:
-                    pass
-
-            _LOGGER.debug(
-                "local_agenda: single-occurrence time change — rec_dt=%s", rec_dt
-            )
-
-            # Find the master VEVENT (no RECURRENCE-ID property)
-            master: Event | None = None
-            for component in cal.walk("VEVENT"):
-                if (str(component.get("uid", "")) == uid
-                        and component.get("RECURRENCE-ID") is None):
-                    master = component
-                    break
-
-            # Non-recurring event guard — symmetric with async_delete_event:
-            # HA 2026.4 always sends a recurrence_id even for single (non-recurring)
-            # events.  For a non-recurring event (master has no RRULE) creating a
-            # RECURRENCE-ID exception VEVENT is semantically wrong: the ICS would
-            # then contain two VEVENTs for the same event, and ws_get_events (which
-            # only returns master VEVENTs) would keep showing the original start
-            # time in the panel — a UI inconsistency the user would see as the
-            # event "not moving" in the event list.  Edit the master in place.
-            if master is not None and master.get("rrule") is None:
-                target: Event = master
-                _LOGGER.debug(
-                    "local_agenda: single-occurrence time change on non-recurring "
-                    "event — editing master in place (no RRULE)"
-                )
-            else:
-                # Recurring event: look for an existing RECURRENCE-ID exception.
-                # Apply the same timezone normalization used in async_delete_event
-                # and the THISANDFUTURE path: HA 2026.4 sends recurrence_id as a
-                # naive datetime string (no TZID) while the stored RECURRENCE-ID in
-                # the .ics may be timezone-aware (TZID= or Z suffix).  Comparing a
-                # naive datetime against an aware one raises TypeError in Python 3,
-                # which was silently swallowed by "except Exception: pass" — leaving
-                # existing_exception always None, causing a second exception VEVENT
-                # to be created and the "doublon" (duplication) the user reported.
-                existing_exception: Event | None = None
-                if rec_dt is not None:
-                    for component in cal.walk("VEVENT"):
-                        if str(component.get("uid", "")) != uid:
-                            continue
-                        exc_rec_id = component.get("RECURRENCE-ID")
-                        if exc_rec_id is not None:
-                            try:
-                                exc_dt = exc_rec_id.dt
-                                cmp_dt = rec_dt
-                                if (isinstance(exc_dt, _dt.datetime)
-                                        and isinstance(cmp_dt, _dt.datetime)):
-                                    if exc_dt.tzinfo is not None and cmp_dt.tzinfo is None:
-                                        exc_dt = exc_dt.replace(tzinfo=None)
-                                    elif exc_dt.tzinfo is None and cmp_dt.tzinfo is not None:
-                                        cmp_dt = cmp_dt.replace(tzinfo=None)
-                                if exc_dt == cmp_dt:
-                                    existing_exception = component
-                                    break
-                            except Exception:
-                                pass
-
-                if existing_exception is not None:
-                    # Update the existing exception in place
-                    target = existing_exception
-                else:
-                    # Create a new RECURRENCE-ID override VEVENT.
-                    # If rec_dt is naive but the master DTSTART is timezone-aware,
-                    # attach the master's timezone to rec_dt before storing it as
-                    # RECURRENCE-ID.  Without this, recurring_ical_events cannot
-                    # match the naive RECURRENCE-ID against the aware RRULE
-                    # occurrence it replaces, and both appear in the calendar
-                    # simultaneously — the second source of the "doublon".
-                    target = Event()
-                    target.add("uid", uid)
-                    if rec_dt is not None:
-                        rec_dt_for_rid = rec_dt
-                        if (isinstance(rec_dt_for_rid, _dt.datetime)
-                                and rec_dt_for_rid.tzinfo is None
-                                and master is not None):
-                            m_start_p = master.get("dtstart")
-                            if (m_start_p is not None
-                                    and isinstance(m_start_p.dt, _dt.datetime)
-                                    and m_start_p.dt.tzinfo is not None):
-                                rec_dt_for_rid = rec_dt_for_rid.replace(
-                                    tzinfo=m_start_p.dt.tzinfo
-                                )
-                        target.add("recurrence-id", rec_dt_for_rid)
-                    # Seed non-time fields from master so nothing is lost
-                    if master is not None:
-                        for field in ("summary", "description", "location"):
-                            val = master.get(field)
-                            if val is not None:
-                                target.add(field, val)
-                    cal.add_component(target)
-
-            # Apply time changes to the exception
-            if new_start is not None:
-                target.pop("dtstart", None)
-                target.add("dtstart", new_start)
-            if new_end is not None:
-                target.pop("dtend", None)
-                target.add("dtend", new_end)
-            elif target.get("dtend") is None and master is not None:
-                # New exception with no explicit end: inherit master duration
-                m_start = master.get("dtstart")
-                m_end   = master.get("dtend")
-                if m_start is not None and m_end is not None and new_start is not None:
-                    duration = m_end.dt - m_start.dt
-                    target.add("dtend", new_start + duration)
-                elif m_end is not None:
-                    target.add("dtend", m_end.dt)
-
-            # Apply non-time field changes to the exception
-            if "summary" in event:
-                target.pop("summary", None)
-                target.add("summary", event["summary"])
-            if "description" in event:
-                target.pop("description", None)
-                if event["description"]:
-                    target.add("description", event["description"])
-            if "location" in event:
-                target.pop("location", None)
-                if event["location"]:
-                    target.add("location", event["location"])
-
+        # HA always sends a recurrence_id, even for a non-recurring event.
+        # Without an RRULE there is no occurrence to single out: the edit
+        # applies to the event itself.
+        if recurrence_id is None or master.get("rrule") is None:
+            _update_whole_series(cal, master, uid, event, new_start, new_end, new_rrule)
         else:
-            # ---------------------------------------------------------------- #
-            # Whole-series edit  OR  single-occurrence non-time field update   #
-            # ---------------------------------------------------------------- #
-            for component in cal.walk("VEVENT"):
-                if str(component.get("uid", "")) != uid:
-                    continue
-
-                is_master = component.get("RECURRENCE-ID") is None
-
-                # ---- Text fields ----
-                # For whole-series edits we update the master AND every
-                # RECURRENCE-ID exception VEVENT, because exceptions override
-                # the master's fields for their specific occurrence.  Without
-                # this, occurrences that were individually edited in the past
-                # would keep showing their old description/summary/location
-                # even after the user chose "apply to all".
-                if "summary" in event:
-                    del component["summary"]
-                    component.add("summary", event["summary"])
-                if "description" in event:
-                    component.pop("description", None)
-                    if event["description"]:
-                        component.add("description", event["description"])
-                if "location" in event:
-                    component.pop("location", None)
-                    if event["location"]:
-                        component.add("location", event["location"])
-
-                # ---- Time + recurrence: whole-series, master VEVENT only ----
-                if editing_whole_series and is_master:
-                    if new_start is not None:
-                        component.pop("dtstart", None)
-                        component.add("dtstart", new_start)
-                    if new_end is not None:
-                        component.pop("dtend", None)
-                        component.add("dtend", new_end)
-
-                    # RRULE — preserve unless explicitly changed
-                    existing_rrule = component.get("rrule")
-                    existing_rrule_str: str | None = None
-                    if existing_rrule is not None:
-                        try:
-                            existing_rrule_str = existing_rrule.to_ical().decode("utf-8")
-                        except Exception:
-                            pass
-
-                    incoming_rrule: str | None = event.get("rrule")
-                    _LOGGER.debug(
-                        "local_agenda: existing_rrule=%s incoming_rrule=%s",
-                        existing_rrule_str, incoming_rrule,
-                    )
-                    if incoming_rrule and incoming_rrule != existing_rrule_str:
-                        component.pop("rrule", None)
-                        try:
-                            component.add("rrule", vRecur.from_ical(incoming_rrule))
-                        except Exception as err:
-                            _LOGGER.warning(
-                                "local_agenda: could not parse rrule '%s': %s",
-                                incoming_rrule, err,
-                            )
-                    elif "rrule" in event and not incoming_rrule and existing_rrule is not None:
-                        # Explicit empty → user intentionally removed recurrence
-                        component.pop("rrule", None)
-                    # else: absent or same → keep existing RRULE untouched
-
-                # For single-occurrence non-time edits: stop after the first
-                # VEVENT (the master) — we then separately update any matching
-                # RECURRENCE-ID exception below.
-                # For whole-series edits: keep iterating to reach all exceptions.
-                if not editing_whole_series:
-                    break
-
-            # Single-occurrence non-time edit: also propagate text changes to
-            # the RECURRENCE-ID exception VEVENT for this specific occurrence,
-            # if one exists (created by a prior time edit for that occurrence).
-            # Without this, an occurrence that was previously moved to a new
-            # time keeps showing the old summary/description/location because
-            # only the master VEVENT was updated by the loop above.
-            if not editing_whole_series and recurrence_id is not None:
-                _rec_dt_text = None
-                try:
-                    _rec_dt_text = vDatetime.from_ical(recurrence_id)
-                except Exception:
-                    try:
-                        _rec_dt_text = vDate.from_ical(recurrence_id)
-                    except Exception:
-                        pass
-                if _rec_dt_text is not None:
-                    for component in cal.walk("VEVENT"):
-                        if str(component.get("uid", "")) != uid:
-                            continue
-                        exc_rec_id = component.get("RECURRENCE-ID")
-                        if exc_rec_id is None:
-                            continue
-                        try:
-                            exc_dt = exc_rec_id.dt
-                            cmp_dt = _rec_dt_text
-                            if (isinstance(exc_dt, _dt.datetime)
-                                    and isinstance(cmp_dt, _dt.datetime)):
-                                if exc_dt.tzinfo is not None and cmp_dt.tzinfo is None:
-                                    exc_dt = exc_dt.replace(tzinfo=None)
-                                elif exc_dt.tzinfo is None and cmp_dt.tzinfo is not None:
-                                    cmp_dt = cmp_dt.replace(tzinfo=None)
-                            if exc_dt != cmp_dt:
-                                continue
-                        except Exception:
-                            continue
-                        # Found the matching exception — propagate text changes
-                        if "summary" in event:
-                            component.pop("summary", None)
-                            component.add("summary", event["summary"])
-                        if "description" in event:
-                            component.pop("description", None)
-                            if event["description"]:
-                                component.add("description", event["description"])
-                        if "location" in event:
-                            component.pop("location", None)
-                            if event["location"]:
-                                component.add("location", event["location"])
-                        _LOGGER.debug(
-                            "local_agenda: single-occurrence text edit — "
-                            "propagated to RECURRENCE-ID exception at %s",
-                            _rec_dt_text,
-                        )
-                        break
-
-        # When a whole-series time edit shifts DTSTART, all existing
-        # RECURRENCE-ID exception VEVENTs become stale: their RECURRENCE-ID
-        # references an occurrence time that no longer exists in the updated
-        # RRULE series.  recurring_ical_events then surfaces them as orphaned
-        # standalone events — the "doublon" reported by the user.
-        # Solution: purge every RECURRENCE-ID exception for that UID so the
-        # series is clean.
-        if editing_whole_series and new_start is not None:
-            # Purge stale RECURRENCE-ID exception VEVENTs: their RECURRENCE-ID
-            # references occurrence times that no longer exist in the updated
-            # RRULE series, so recurring_ical_events would surface them as
-            # orphaned standalone events ("doublon").
-            before_count = len(cal.subcomponents)
-            cal.subcomponents = [
-                c for c in cal.subcomponents
-                if not (
-                    c.name == "VEVENT"
-                    and str(c.get("uid", "")) == uid
-                    and c.get("RECURRENCE-ID") is not None
+            rec_dt = _recurrence_dt(recurrence_id, master)
+            if rec_dt is None:
+                raise HomeAssistantError(
+                    f"local_agenda: unreadable recurrence id '{recurrence_id}'"
                 )
-            ]
-            removed = before_count - len(cal.subcomponents)
-            if removed:
-                _LOGGER.debug(
-                    "local_agenda: whole-series time edit — removed %d stale "
-                    "RECURRENCE-ID exception(s) for uid=%s",
-                    removed, uid,
+            if recurrence_range == "THISANDFUTURE":
+                _update_this_and_future(
+                    cal, master, uid, event, rec_dt, new_start, new_end, new_rrule
                 )
-            # Also purge EXDATE entries from the master VEVENT: after shifting
-            # DTSTART the RRULE generates occurrences at entirely new times, so
-            # existing EXDATEs reference times that no longer exist in the series
-            # and accumulate as harmless but obsolete clutter in the .ics file.
-            for component in cal.walk("VEVENT"):
-                if (str(component.get("uid", "")) == uid
-                        and component.get("RECURRENCE-ID") is None):
-                    exdate_keys = [k for k in component.keys() if k.upper() == "EXDATE"]
-                    if exdate_keys:
-                        for k in exdate_keys:
-                            component.pop(k, None)
-                        _LOGGER.debug(
-                            "local_agenda: whole-series time edit — cleared %d "
-                            "stale EXDATE(s) from master for uid=%s",
-                            len(exdate_keys), uid,
-                        )
-                    break
+            else:
+                _update_single_occurrence(
+                    cal, master, uid, event, rec_dt, new_start, new_end
+                )
 
-        await self._store.async_save(self._hass)
-        await self._refresh_next_event()
-        self.async_write_ha_state()
-        self._notify_panel_updated()
+        await self._async_saved()
+
+
+# ------------------------------------------------------------------
+# Edit helpers
+# ------------------------------------------------------------------
+
+# Successive look-ahead windows used to find the next upcoming event.
+_NEXT_EVENT_HORIZONS_DAYS = (7, 60, 365)
+
+_TEXT_FIELDS = ("summary", "description", "location")
+
+
+def _rrule_to_str(rrule_prop: Any) -> str | None:
+    """Return an RRULE property as text, or None."""
+    if rrule_prop is None:
+        return None
+    try:
+        return rrule_prop.to_ical().decode("utf-8")
+    except Exception:
+        return None
+
+
+def _parse_rrule(rrule: str | None) -> vRecur | None:
+    """Parse the RRULE text sent by HA; None when there is none."""
+    if not rrule:
+        return None
+    try:
+        return vRecur.from_ical(rrule)
+    except Exception as err:
+        raise HomeAssistantError(
+            f"local_agenda: invalid recurrence rule '{rrule}': {err}"
+        ) from err
+
+
+def _has_uid(cal: Calendar, uid: str) -> bool:
+    return any(
+        c.name == "VEVENT" and str(c.get("uid", "")) == uid
+        for c in cal.subcomponents
+    )
+
+
+def _find_master(cal: Calendar, uid: str) -> Event | None:
+    """Return the master VEVENT of a UID (the one without RECURRENCE-ID).
+
+    Exceptions (RECURRENCE-ID VEVENTs) share the same uid but must not be
+    confused with the master when modifying RRULE, EXDATE or the times.
+    """
+    for component in cal.walk("VEVENT"):
+        if (str(component.get("uid", "")) == uid
+                and component.get("RECURRENCE-ID") is None):
+            return component
+    return None
+
+
+def _remove_uid(cal: Calendar, uid: str) -> None:
+    """Remove a whole series: the master and all its exceptions."""
+    before = len(cal.subcomponents)
+    cal.subcomponents = [
+        c for c in cal.subcomponents
+        if not (c.name == "VEVENT" and str(c.get("uid", "")) == uid)
+    ]
+    _LOGGER.debug(
+        "local_agenda: removed %d component(s) for uid=%s",
+        before - len(cal.subcomponents), uid,
+    )
+
+
+def _remove_overrides(cal: Calendar, uid: str, matches: Any) -> None:
+    """Remove the RECURRENCE-ID exceptions of a UID whose id satisfies `matches`."""
+
+    def _is_match(c: Any) -> bool:
+        if c.name != "VEVENT" or str(c.get("uid", "")) != uid:
+            return False
+        rid = c.get("RECURRENCE-ID")
+        return rid is not None and matches(rid.dt)
+
+    before = len(cal.subcomponents)
+    cal.subcomponents = [c for c in cal.subcomponents if not _is_match(c)]
+    _LOGGER.debug(
+        "local_agenda: removed %d RECURRENCE-ID exception(s) for uid=%s",
+        before - len(cal.subcomponents), uid,
+    )
+
+
+def _recurrence_dt(recurrence_id: str, master: Event | None) -> date | datetime | None:
+    """Turn the recurrence_id sent by HA into a date or datetime.
+
+    HA sends back the RECURRENCE-ID of the occurrence as iCalendar text.
+    For an event stored with a TZID that text is a wall-clock time without
+    any timezone ("20261009T143000"): it is expressed in the timezone of the
+    master's DTSTART, which is therefore attached to it.  Comparing instants
+    is then exact, where dropping the timezone of the other side would
+    compare wall-clock times of possibly different zones.
+    """
+    rec_dt: date | datetime | None = None
+    for parser in (vDatetime, vDate):
+        try:
+            rec_dt = parser.from_ical(recurrence_id)
+            break
+        except Exception:
+            continue
+    if (isinstance(rec_dt, datetime) and rec_dt.tzinfo is None
+            and master is not None):
+        dtstart = master.get("dtstart")
+        if (dtstart is not None and isinstance(dtstart.dt, datetime)
+                and dtstart.dt.tzinfo is not None):
+            rec_dt = rec_dt.replace(tzinfo=dtstart.dt.tzinfo)
+    return rec_dt
+
+
+def _comparable_pair(
+    a: date | datetime, b: date | datetime
+) -> tuple[datetime, datetime]:
+    """Return two values of the same kind, so they can be compared.
+
+    A date becomes midnight.  When only one side has a timezone (a floating
+    time in an imported .ics) there is nothing to convert with: both are
+    then compared as wall-clock times.
+    """
+    if not isinstance(a, datetime):
+        a = datetime(a.year, a.month, a.day)
+    if not isinstance(b, datetime):
+        b = datetime(b.year, b.month, b.day)
+    if (a.tzinfo is None) != (b.tzinfo is None):
+        a = a.replace(tzinfo=None)
+        b = b.replace(tzinfo=None)
+    return a, b
+
+
+def _same_moment(a: date | datetime, b: date | datetime) -> bool:
+    if isinstance(a, datetime) != isinstance(b, datetime):
+        return False  # an all-day value never equals a timed one
+    a, b = _comparable_pair(a, b)
+    return a == b
+
+
+def _is_before(a: date | datetime, b: date | datetime) -> bool:
+    a, b = _comparable_pair(a, b)
+    return a < b
+
+
+def _apply_text_fields(component: Event, event: dict[str, Any]) -> None:
+    """Copy the summary / description / location present in `event`."""
+    for field in _TEXT_FIELDS:
+        if field not in event:
+            continue
+        component.pop(field, None)
+        value = event[field]
+        if field == "summary":
+            component.add(field, value or "")
+        elif value:
+            component.add(field, value)
+
+
+def _set_times(
+    component: Event,
+    new_start: date | datetime | None,
+    new_end: date | datetime | None,
+) -> None:
+    if new_start is not None:
+        component.pop("dtstart", None)
+        component.add("dtstart", new_start)
+    if new_end is not None:
+        component.pop("dtend", None)
+        component.add("dtend", new_end)
+
+
+def _duration(component: Event) -> timedelta | None:
+    """Return DTEND - DTSTART of a VEVENT, or None."""
+    start = component.get("dtstart")
+    end = component.get("dtend")
+    if start is None or end is None:
+        return None
+    try:
+        return end.dt - start.dt
+    except TypeError:
+        return None
+
+
+def _truncate_series(
+    cal: Calendar, master: Event, uid: str, rec_dt: date | datetime
+) -> None:
+    """End a recurring series just before the occurrence at `rec_dt`.
+
+    Sets UNTIL on the master RRULE and drops the exceptions that are now
+    beyond the end.  When `rec_dt` is the first occurrence nothing would be
+    left — UNTIL would precede DTSTART, yet DTSTART itself would still be
+    returned as an occurrence — so the whole series is removed instead.
+    """
+    if isinstance(rec_dt, datetime):
+        until: date | datetime = rec_dt - timedelta(seconds=1)
+        if until.tzinfo is not None:
+            # RFC 5545: UNTIL is in UTC when DTSTART has a timezone.
+            until = until.astimezone(timezone.utc)
+    else:
+        until = rec_dt - timedelta(days=1)
+
+    dtstart = master.get("dtstart")
+    if dtstart is not None and _is_before(until, dtstart.dt):
+        _LOGGER.debug(
+            "local_agenda: truncating uid=%s at its first occurrence — "
+            "removing the whole series", uid,
+        )
+        _remove_uid(cal, uid)
+        return
+
+    rrule = master.get("rrule")
+    rrule["UNTIL"] = [until]
+    rrule.pop("COUNT", None)
+    _LOGGER.debug("local_agenda: uid=%s — series UNTIL set to %s", uid, until)
+    _remove_overrides(cal, uid, lambda rid: not _is_before(rid, rec_dt))
+
+
+def _update_whole_series(
+    cal: Calendar,
+    master: Event,
+    uid: str,
+    event: dict[str, Any],
+    new_start: date | datetime | None,
+    new_end: date | datetime | None,
+    new_rrule: vRecur | None,
+) -> None:
+    """Apply an edit to a whole series (or to a non-recurring event)."""
+    # Text fields go to the master AND to every RECURRENCE-ID exception:
+    # an exception overrides the master's fields for its own occurrence, so
+    # occurrences edited individually in the past would otherwise keep their
+    # old summary/description/location after an "apply to all".
+    for component in cal.walk("VEVENT"):
+        if str(component.get("uid", "")) == uid:
+            _apply_text_fields(component, event)
+
+    old_start = master.get("dtstart")
+    start_moved = (
+        new_start is not None
+        and (old_start is None or not _same_moment(old_start.dt, new_start))
+    )
+    _set_times(master, new_start, new_end)
+
+    # RRULE — preserve unless explicitly changed
+    if new_rrule is not None:
+        if _rrule_to_str(new_rrule) != _rrule_to_str(master.get("rrule")):
+            master.pop("rrule", None)
+            master.add("rrule", new_rrule)
+    elif "rrule" in event:
+        # Explicit empty → user intentionally removed recurrence
+        master.pop("rrule", None)
+    # else: absent → keep existing RRULE untouched
+
+    if start_moved:
+        # Shifting DTSTART moves every occurrence: the RECURRENCE-ID
+        # exceptions and the EXDATEs now point at times that no longer exist
+        # in the series.  recurring_ical_events would surface the exceptions
+        # as orphaned standalone events (duplicates), so both are purged.
+        # HA sends the start on every edit: this must only happen when the
+        # start really changed, or editing a title would bring back every
+        # deleted occurrence.
+        _remove_overrides(cal, uid, lambda rid: True)
+        for key in [k for k in master.keys() if k.upper() == "EXDATE"]:
+            master.pop(key, None)
+
+
+def _update_single_occurrence(
+    cal: Calendar,
+    master: Event,
+    uid: str,
+    event: dict[str, Any],
+    rec_dt: date | datetime,
+    new_start: date | datetime | None,
+    new_end: date | datetime | None,
+) -> None:
+    """Apply an edit to one occurrence of a recurring series.
+
+    RFC 5545 requires a RECURRENCE-ID override VEVENT for this: the master
+    VEVENT is left alone, whether the edit changes the time or only a text
+    field — writing to the master would change the whole series.
+    """
+    target: Event | None = None
+    for component in cal.walk("VEVENT"):
+        if str(component.get("uid", "")) != uid:
+            continue
+        rid = component.get("RECURRENCE-ID")
+        if rid is not None and _same_moment(rid.dt, rec_dt):
+            target = component
+            break
+
+    if target is None:
+        target = Event()
+        target.add("uid", uid)
+        target.add("dtstamp", dt_util.utcnow())
+        target.add("recurrence-id", rec_dt)
+        # Seed non-time fields from master so nothing is lost
+        for field in _TEXT_FIELDS:
+            value = master.get(field)
+            if value is not None:
+                target.add(field, value)
+        cal.add_component(target)
+
+    _set_times(target, new_start, new_end)
+    if target.get("dtstart") is None:
+        # Text-only edit: the occurrence keeps its original time.
+        target.add("dtstart", rec_dt)
+    if target.get("dtend") is None:
+        duration = _duration(master)
+        if duration is not None:
+            target.add("dtend", target.get("dtstart").dt + duration)
+
+    _apply_text_fields(target, event)
+
+
+def _update_this_and_future(
+    cal: Calendar,
+    master: Event,
+    uid: str,
+    event: dict[str, Any],
+    rec_dt: date | datetime,
+    new_start: date | datetime | None,
+    new_end: date | datetime | None,
+    new_rrule: vRecur | None,
+) -> None:
+    """Apply an edit to one occurrence and all the following ones.
+
+    RFC 5545 §3.8.4.4 RANGE=THISANDFUTURE: the original series is truncated
+    just before `rec_dt` and a new series starts there.
+    """
+    # Read what the new series inherits BEFORE truncating: the truncation
+    # rewrites the master's RRULE (UNTIL), which must not be inherited.
+    original_rrule = _rrule_to_str(master.get("rrule"))
+    duration = _duration(master)
+
+    _truncate_series(cal, master, uid, rec_dt)
+
+    new_series = Event()
+    new_uid = str(uuid.uuid4())
+    new_series.add("uid", new_uid)
+    new_series.add("dtstamp", dt_util.utcnow())
+
+    series_start = new_start if new_start is not None else rec_dt
+    new_series.add("dtstart", series_start)
+    if new_end is not None:
+        new_series.add("dtend", new_end)
+    elif duration is not None:
+        new_series.add("dtend", series_start + duration)
+
+    if new_rrule is not None:
+        new_series.add("rrule", new_rrule)
+    elif "rrule" not in event and original_rrule is not None:
+        # HA sent no rule at all: the new series repeats like the old one.
+        # (An explicit empty rule means the recurrence was removed.)
+        new_series.add("rrule", vRecur.from_ical(original_rrule))
+
+    # Text fields: prefer event dict, fall back to master
+    for field in _TEXT_FIELDS:
+        value = event.get(field)
+        if value is not None:
+            if value:
+                new_series.add(field, value)
+        else:
+            master_value = master.get(field)
+            if master_value is not None:
+                new_series.add(field, master_value)
+
+    cal.add_component(new_series)
+    _LOGGER.debug(
+        "local_agenda: THISANDFUTURE update — new series uid=%s dtstart=%s",
+        new_uid, series_start,
+    )
 
 
 # ------------------------------------------------------------------
@@ -995,9 +759,9 @@ def _component_to_event(
     """Convert an icalendar VEVENT component to a CalendarEvent.
 
     rrule_override — pass the RRULE string extracted from the *master* VEVENT.
-    recurring_ical_events v2.x does not include RRULE on the occurrence
-    objects it returns, so without this the CalendarEvent would have rrule=None
-    and the HA edit dialog would display "Jamais" for every recurring event.
+    recurring_ical_events does not include RRULE on the occurrence objects it
+    returns, so without this the CalendarEvent would have rrule=None and the
+    HA edit dialog would display "Jamais" for every recurring event.
     """
     try:
         dtstart = component.get("dtstart")
@@ -1007,17 +771,9 @@ def _component_to_event(
         start = dtstart.dt
         end = dtend.dt if dtend else start
 
-        # RRULE: prefer the value passed from the master VEVENT.
-        # Fall back to reading it from the component (handles non-recurring
-        # events and any future library version that does copy RRULE).
-        rrule_str: str | None = rrule_override
-        if rrule_str is None:
-            rrule_prop = component.get("rrule")
-            if rrule_prop is not None:
-                try:
-                    rrule_str = rrule_prop.to_ical().decode("utf-8")
-                except Exception:
-                    pass
+        # RRULE: prefer the value passed from the master VEVENT, fall back
+        # to the component's own.
+        rrule_str = rrule_override or _rrule_to_str(component.get("rrule"))
 
         # RECURRENCE-ID: set by recurring_ical_events on each expanded
         # occurrence; lets HA identify which instance is being edited/deleted.
@@ -1029,39 +785,16 @@ def _component_to_event(
             except Exception:
                 pass
 
-        # CalendarEvent gained `rrule` in HA 2024.x and `recurrence_id`
-        # later — fall back gracefully for older installs.
-        try:
-            return CalendarEvent(
-                summary=str(component.get("summary", "")),
-                start=start,
-                end=end,
-                description=str(component.get("description", "")) or None,
-                location=str(component.get("location", "")) or None,
-                uid=str(component.get("uid", "")),
-                rrule=rrule_str,
-                recurrence_id=recurrence_id_str,
-            )
-        except TypeError:
-            try:
-                return CalendarEvent(
-                    summary=str(component.get("summary", "")),
-                    start=start,
-                    end=end,
-                    description=str(component.get("description", "")) or None,
-                    location=str(component.get("location", "")) or None,
-                    uid=str(component.get("uid", "")),
-                    rrule=rrule_str,
-                )
-            except TypeError:
-                return CalendarEvent(
-                    summary=str(component.get("summary", "")),
-                    start=start,
-                    end=end,
-                    description=str(component.get("description", "")) or None,
-                    location=str(component.get("location", "")) or None,
-                    uid=str(component.get("uid", "")),
-                )
+        return CalendarEvent(
+            summary=str(component.get("summary", "")),
+            start=start,
+            end=end,
+            description=str(component.get("description", "")) or None,
+            location=str(component.get("location", "")) or None,
+            uid=str(component.get("uid", "")),
+            rrule=rrule_str,
+            recurrence_id=recurrence_id_str,
+        )
     except Exception as err:
         _LOGGER.debug("Skipping malformed VEVENT: %s", err)
         return None

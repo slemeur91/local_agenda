@@ -44,6 +44,7 @@ With conditions — dict with optional `conditions` + `actions` keys:
 
 Both `on_start` and `on_stop` accept either format independently.
 Supported condition types: state, or, and, not.
+A condition of any other type is treated as not met.
 """
 from __future__ import annotations
 
@@ -56,9 +57,13 @@ from homeassistant.core import HomeAssistant
 
 _LOGGER = logging.getLogger(__name__)
 
+# Reading: the YAML sits on its own lines between the two markers.
 ACTIONS_BLOCK_RE = re.compile(
     r"---actions---\s*\n(.*?)\n---/actions---", re.DOTALL
 )
+# Rewriting: anything between the two markers, even a block too malformed to
+# be read, so that saving replaces it instead of appending a second block.
+_ANY_ACTIONS_BLOCK_RE = re.compile(r"---actions---.*?---/actions---", re.DOTALL)
 
 
 # ---------------------------------------------------------------------------
@@ -97,12 +102,55 @@ def parse_actions(description: str | None) -> dict[str, Any]:
         return {}
 
 
+def set_actions_block(description: str | None, actions: dict[str, Any]) -> str:
+    """Return `description` with its actions block replaced by `actions`.
+
+    The block is appended when the description has none, and removed when
+    `actions` is empty.  Text around the block is preserved.
+    """
+    description = description or ""
+    if actions:
+        actions_yaml = yaml.dump(
+            actions, allow_unicode=True, default_flow_style=False
+        )
+        block = f"---actions---\n{actions_yaml}---/actions---"
+    else:
+        block = ""
+
+    if _ANY_ACTIONS_BLOCK_RE.search(description):
+        # A function as replacement: a plain string would have its
+        # backslashes interpreted by re.sub ("\\d", "\\n", "\\1", …).
+        return _ANY_ACTIONS_BLOCK_RE.sub(lambda _m: block, description).strip()
+    if not block:
+        return description.strip()
+    sep = "\n\n" if description.strip() else ""
+    return (description.strip() + sep + block).strip()
+
+
 # ---------------------------------------------------------------------------
 # Condition evaluation
 # ---------------------------------------------------------------------------
 
-async def _check_single_condition(hass: HomeAssistant, cond: dict) -> bool:
+def _expected_state(value: Any) -> str:
+    """Return the state text a YAML value stands for.
+
+    Unquoted `on` / `off` / `yes` / `no` are booleans in YAML; in a state
+    condition they can only mean the "on" / "off" states.
+    """
+    if value is True:
+        return "on"
+    if value is False:
+        return "off"
+    return str(value)
+
+
+async def _check_single_condition(hass: HomeAssistant, cond: Any) -> bool:
     """Evaluate a single HA-style condition dict."""
+    if not isinstance(cond, dict):
+        _LOGGER.warning(
+            "local_agenda: malformed condition %r — treated as not met", cond
+        )
+        return False
     kind = cond.get("condition", "")
 
     if kind == "state":
@@ -114,29 +162,33 @@ async def _check_single_condition(hass: HomeAssistant, cond: dict) -> bool:
             return False
         actual = state_obj.state
         if isinstance(expected, list):
-            return actual in expected
-        return actual == str(expected)
+            return actual in [_expected_state(e) for e in expected]
+        return actual == _expected_state(expected)
 
     if kind == "or":
-        for sub in cond.get("conditions", []):
+        for sub in cond.get("conditions") or []:
             if await _check_single_condition(hass, sub):
                 return True
         return False
 
     if kind == "and":
-        for sub in cond.get("conditions", []):
+        for sub in cond.get("conditions") or []:
             if not await _check_single_condition(hass, sub):
                 return False
         return True
 
     if kind == "not":
-        for sub in cond.get("conditions", []):
+        for sub in cond.get("conditions") or []:
             if await _check_single_condition(hass, sub):
                 return False
         return True
 
-    _LOGGER.warning("local_agenda: unsupported condition type '%s'", kind)
-    return True  # permissive: unknown condition doesn't block execution
+    # Fail closed: a typo in the condition type must not turn a conditional
+    # action into an unconditional one.
+    _LOGGER.warning(
+        "local_agenda: unsupported condition type '%s' — treated as not met", kind
+    )
+    return False
 
 
 async def _conditions_pass(
@@ -171,7 +223,7 @@ async def _call_services(
         if not isinstance(action, dict):
             continue
         service_str = action.get("service", "")
-        if "." not in service_str:
+        if not isinstance(service_str, str) or "." not in service_str:
             _LOGGER.warning(
                 "local_agenda: invalid service '%s' in actions block", service_str
             )
@@ -218,8 +270,12 @@ async def fire_actions(
         await _call_services(hass, phase_config, event_summary, phase)
 
     elif isinstance(phase_config, dict):
-        conditions: list[dict] = phase_config.get("conditions") or []
-        service_list: list[dict] = phase_config.get("actions") or []
+        conditions = phase_config.get("conditions") or []
+        service_list = phase_config.get("actions") or []
+        if not isinstance(conditions, list):
+            conditions = [conditions]
+        if not isinstance(service_list, list):
+            service_list = [service_list]
 
         if conditions:
             ok = await _conditions_pass(hass, conditions, event_summary, phase)

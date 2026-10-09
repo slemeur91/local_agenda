@@ -2,7 +2,7 @@
 // Vanilla JS custom element, no build step required.
 // Registered automatically by the integration via async_register_built_in_panel.
 
-const VERSION = "1.9.0";
+const VERSION = "1.9.1";
 console.info(`%c[local_agenda] panel.js v${VERSION} loaded`, "color:#03a9f4;font-weight:bold;");
 
 // ---------------------------------------------------------------------------
@@ -514,11 +514,12 @@ function parseSimpleCond(cond) {
   return { entity: c.entity_id, states: states.slice(), negate };
 }
 
-// Python's str() for the scalar types YAML can yield — the backend compares
-// the entity state with str(expected).
-function pyStr(v) {
-  if (v === true) return "True";
-  if (v === false) return "False";
+// Mirrors _expected_state() in actions.py: unquoted YAML `on` / `off` arrive
+// as booleans and stand for the "on" / "off" states; anything else goes
+// through Python's str().
+function expectedState(v) {
+  if (v === true) return "on";
+  if (v === false) return "off";
   if (v === null || v === undefined) return "None";
   return String(v);
 }
@@ -532,13 +533,13 @@ function evalCondition(cond, states) {
     case "state": {
       const st = states[cond.entity_id];
       if (!st) return false;
-      if (Array.isArray(cond.state)) return cond.state.includes(st.state);
-      return st.state === pyStr(cond.state);
+      if (Array.isArray(cond.state)) return cond.state.map(expectedState).includes(st.state);
+      return st.state === expectedState(cond.state);
     }
     case "or": return subs.some(s => evalCondition(s, states));
     case "and": return subs.every(s => evalCondition(s, states));
     case "not": return !subs.some(s => evalCondition(s, states));
-    default: return true; // the backend lets unknown condition types pass
+    default: return false; // the backend treats unknown condition types as not met
   }
 }
 
@@ -1531,7 +1532,7 @@ class LocalAgendaPanel extends HTMLElement {
     this._calendars.forEach(cal => {
       const item = document.createElement("div");
       item.className = "cal-item" + (this._selectedCalendar?.entry_id === cal.entry_id ? " active" : "");
-      item.innerHTML = `<div class="cal-dot"></div><span>${cal.name}</span>`;
+      item.innerHTML = `<div class="cal-dot"></div><span>${escHtml(cal.name)}</span>`;
       item.onclick = () => this._selectCalendar(cal);
       list.appendChild(item);
     });
@@ -1631,7 +1632,7 @@ class LocalAgendaPanel extends HTMLElement {
     hdr.className = "editor-header";
     hdr.innerHTML = `
       <div>
-        <div class="editor-title">${this._selectedEvent.summary || "(sans titre)"}</div>
+        <div class="editor-title">${escHtml(this._selectedEvent.summary || "(sans titre)")}</div>
         <div style="font-size:13px;color:var(--secondary-text-color);margin-top:2px;">
           ${(this._selectedEvent.start || "").substring(0, 10)}
           ${this._selectedEvent.rrule ? " · 🔁 Récurrent" : ""}

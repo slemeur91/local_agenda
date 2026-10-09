@@ -3,6 +3,66 @@
 Les versions antérieures à la 1.2.0 sont décrites dans les
 [releases GitHub](https://github.com/slemeur91/local_agenda/releases).
 
+## 1.2.2 – 2026-10-09
+
+Version de corrections issue d'un audit du code.
+
+### Changements de comportement
+
+- **Le panneau Local Agenda et son API sont réservés aux administrateurs.**
+  Un utilisateur non administrateur pouvait y définir des appels de service
+  exécutés ensuite sans contrôle de droits.
+- **Une condition d'un type inconnu est désormais considérée comme non
+  remplie** (elle était considérée comme vraie). Une faute de frappe dans le
+  type ne rend plus une action inconditionnelle.
+- `state: on` et `state: off` écrits sans guillemets sont compris comme les
+  états `on` et `off` (ils ne correspondaient jamais).
+
+### Corrections
+
+- **Panneau (panel.js 1.9.1)** : le titre de l'événement et le nom du
+  calendrier sont échappés avant affichage (injection HTML possible).
+- **Sauvegarde des actions** : une valeur contenant `\` (chemin Windows,
+  expression régulière, `\n`…) faisait échouer ou altérait la deuxième
+  sauvegarde d'un événement.
+- **Actions des occurrences déplacées** : les actions enregistrées depuis le
+  panneau sont aussi écrites dans les occurrences modifiées individuellement,
+  qui conservaient les anciennes.
+- **Modification d'une seule occurrence** : changer uniquement le titre, la
+  description ou le lieu d'une occurrence ne modifie plus toute la série.
+- **Modification de toute la série** : les occurrences supprimées ou
+  déplacées ne sont plus réinitialisées quand l'heure de début n'a pas
+  changé.
+- **« Cet événement et les suivants »** : la nouvelle série n'hérite plus
+  d'une règle de récurrence déjà terminée ; à la suppression, les occurrences
+  déplacées situées après la coupure sont retirées elles aussi.
+- **Scheduleur** : une erreur sur un événement n'empêche plus les autres
+  événements du même tick de se déclencher ; les événements sans fuseau
+  horaire sont lus en heure locale.
+- **Fichier de stockage** : écriture atomique (plus de fichier tronqué en cas
+  de coupure), fichier illisible signalé clairement et laissé intact.
+- **Nom du fichier** : deux agendas ne peuvent plus partager le même fichier
+  (« Mon agenda » et « mon_agenda »), et un nom ne peut plus créer de
+  sous-dossier ni sortir du dossier de stockage. Les fichiers existants
+  gardent leur nom.
+- **Erreurs remontées à l'interface** : une création ou une modification
+  impossible (événement introuvable, règle de récurrence invalide) affiche
+  une erreur au lieu d'échouer en silence.
+- Les événements créés portent un `DTSTAMP`, obligatoire dans la norme
+  iCalendar.
+
+### Technique
+
+- Moins de calculs : le calendrier est développé en une seule passe, et la
+  recherche du prochain événement commence par une fenêtre d'une semaine.
+- `manifest.json` : dépendances `http`, `frontend` et `websocket_api`
+  déclarées, `iot_class` corrigé en `local_polling`.
+- Traductions : `strings.json` en anglais, messages d'erreur ajoutés en
+  français et en anglais.
+- `calendar.py` réorganisé en fonctions courtes ; suppression de deux
+  commandes WebSocket inutilisées.
+- Ajout d'une suite de tests (`tests/`).
+
 ## 1.2.1 – 2026-10-09
 
 ### Documentation

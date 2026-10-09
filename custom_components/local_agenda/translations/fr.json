@@ -3,11 +3,17 @@
     "step": {
       "user": {
         "title": "Créer un calendrier Local Agenda",
-        "description": "Créez un calendrier qui peut stocker les événements localement et déclencher des services au début/à la fin de l'événement.",
+        "description": "Créez un calendrier qui stocke ses événements localement. Des services Home Assistant peuvent être appelés au début et à la fin de chaque événement grâce à un bloc YAML dans sa description.",
         "data": {
           "calendar_name": "Nom du calendrier"
         }
       }
+    },
+    "error": {
+      "invalid_name": "Le nom du calendrier ne peut pas être vide."
+    },
+    "abort": {
+      "already_configured": "Un calendrier portant ce nom existe déjà."
     }
   }
 }

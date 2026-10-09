@@ -7,7 +7,7 @@ import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.helpers import config_validation as cv
 
-from .const import CONF_CALENDAR_NAME, DOMAIN
+from .const import CONF_CALENDAR_NAME, DOMAIN, calendar_file_key
 
 
 class LocalAgendaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
@@ -26,9 +26,19 @@ class LocalAgendaConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             if not name:
                 errors[CONF_CALENDAR_NAME] = "invalid_name"
             else:
+                # Two calendars must never share one .ics file.  The unique
+                # id alone cannot guarantee it ("Mon agenda" and "mon_agenda"
+                # have different ids but the same file), so compare file keys.
+                file_key = calendar_file_key(name)
+                for entry in self._async_current_entries():
+                    other = entry.data.get(CONF_CALENDAR_NAME, "")
+                    if calendar_file_key(other) == file_key:
+                        return self.async_abort(reason="already_configured")
                 await self.async_set_unique_id(f"local_agenda_{name.lower()}")
                 self._abort_if_unique_id_configured()
-                return self.async_create_entry(title=name, data=user_input)
+                return self.async_create_entry(
+                    title=name, data={**user_input, CONF_CALENDAR_NAME: name}
+                )
 
         data_schema = vol.Schema(
             {

@@ -7,15 +7,19 @@ from pathlib import Path
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
+from homeassistant.exceptions import ConfigEntryError
+from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.event import async_track_time_interval
 
-from .const import DOMAIN, CONF_CALENDAR_NAME
+from .const import DOMAIN, CONF_CALENDAR_NAME, calendar_file_key, legacy_file_key
 from .store import LocalAgendaStore
 from .actions import parse_actions, fire_actions
 
 _LOGGER = logging.getLogger(__name__)
 
 PLATFORMS = ["calendar"]
+
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 _PANEL_REGISTERED = False
 
@@ -63,7 +67,9 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:  # type: ignor
                     "trust_external_script": False,
                 }
             },
-            require_admin=False,
+            # The panel edits what the scheduler runs with no permission
+            # check of its own: it must stay reserved to administrators.
+            require_admin=True,
         )
     except Exception as err:
         _LOGGER.warning("local_agenda: could not register panel: %s", err)
@@ -82,11 +88,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     hass.data.setdefault(DOMAIN, {})
 
     name = entry.data.get(CONF_CALENDAR_NAME, "local_agenda")
-    safe_name = name.lower().replace(" ", "_")
-    store_path = Path(hass.config.path(".storage")) / f"local_agenda_{safe_name}.ics"
+    storage_dir = Path(hass.config.path(".storage"))
+    store_path = storage_dir / f"local_agenda_{calendar_file_key(name)}.ics"
+    legacy_path = storage_dir / f"local_agenda_{legacy_file_key(name)}.ics"
+    if legacy_path != store_path:
+        await hass.async_add_executor_job(
+            _move_legacy_file, legacy_path, store_path
+        )
 
     store = LocalAgendaStore(store_path)
-    await store.async_load(hass)
+    try:
+        await store.async_load(hass)
+    except (OSError, ValueError) as err:
+        raise ConfigEntryError(str(err)) from err
 
     hass.data[DOMAIN][entry.entry_id] = {
         "store": store,
@@ -110,13 +124,33 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
         hass.data[DOMAIN].pop(entry.entry_id, None)
+        hass.data[DOMAIN].pop(entry.entry_id + "_fired", None)
     return unload_ok
+
+
+def _move_legacy_file(legacy_path: Path, store_path: Path) -> None:
+    """Move a calendar file saved under its pre-1.2.2 name (blocking).
+
+    Up to 1.2.1 the calendar name went into the file name unsanitised, so a
+    name containing "/" was stored in a sub-folder.  Bring such a file to its
+    new location once, without ever replacing an existing file.
+    """
+    try:
+        if legacy_path.is_file() and not store_path.exists():
+            legacy_path.replace(store_path)
+            _LOGGER.info(
+                "local_agenda: moved calendar file %s to %s", legacy_path, store_path
+            )
+    except OSError as err:
+        _LOGGER.warning(
+            "local_agenda: could not move calendar file %s to %s: %s",
+            legacy_path, store_path, err,
+        )
 
 
 async def _check_actions(hass: HomeAssistant, entry: ConfigEntry) -> None:
     """Fire on_start / on_stop actions for events crossing the current time."""
     from homeassistant.util import dt as dt_util
-    import datetime as _dt
 
     now = dt_util.utcnow()
     window = timedelta(seconds=22)
@@ -156,43 +190,65 @@ async def _check_actions(hass: HomeAssistant, entry: ConfigEntry) -> None:
             continue
 
         for evt in events:
-            uid = getattr(evt, "uid", None) or evt.summary or "?"
-            description = getattr(evt, "description", "") or ""
-            actions = parse_actions(description)
-            if not actions:
-                continue
+            # One malformed event (bad actions block, unexpected date type…)
+            # must not prevent the other events of this tick from firing.
+            try:
+                await _check_event(hass, entry, evt, now, window, fired)
+            except Exception:
+                _LOGGER.exception(
+                    "local_agenda: action check failed for event '%s'",
+                    getattr(evt, "summary", "?"),
+                )
 
-            start = evt.start
-            end = evt.end
 
-            if isinstance(start, _dt.date) and not isinstance(start, _dt.datetime):
-                start = dt_util.start_of_local_day(start)
-            if isinstance(end, _dt.date) and not isinstance(end, _dt.datetime):
-                end = dt_util.start_of_local_day(end)
+def _comparable(value):  # type: ignore[no-untyped-def]
+    """Return a tz-aware datetime for a CalendarEvent start/end value.
 
-            # Include the occurrence timestamp in the key so that different
-            # occurrences of the same recurring event (same UID) each get a
-            # unique deduplication entry.  Without the timestamp, the first
-            # occurrence would "burn" the key for all subsequent occurrences,
-            # silently preventing them from ever firing again in the same
-            # HA session.
-            start_iso = start.isoformat() if isinstance(start, _dt.datetime) else str(start)
-            end_iso   = end.isoformat()   if isinstance(end,   _dt.datetime) else str(end)
+    All-day values (dates) start at local midnight; a floating datetime (no
+    timezone, possible in an imported .ics) is read as local time.  Without
+    this, comparing it with the UTC "now" raises TypeError.
+    """
+    import datetime as _dt
+    from homeassistant.util import dt as dt_util
 
-            start_key = f"{entry.entry_id}:{uid}:{start_iso}:start"
-            if (
-                now - window <= start <= now
-                and start_key not in fired
-                and actions.get("on_start")
-            ):
-                await fire_actions(hass, actions["on_start"], evt.summary, "start")
-                fired[start_key] = now
+    if not isinstance(value, _dt.datetime):
+        return dt_util.start_of_local_day(value)
+    if value.tzinfo is None:
+        return value.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
+    return value
 
-            stop_key = f"{entry.entry_id}:{uid}:{end_iso}:stop"
-            if (
-                now - window <= end <= now
-                and stop_key not in fired
-                and actions.get("on_stop")
-            ):
-                await fire_actions(hass, actions["on_stop"], evt.summary, "stop")
-                fired[stop_key] = now
+
+async def _check_event(hass, entry, evt, now, window, fired) -> None:  # type: ignore[no-untyped-def]
+    """Fire the actions of one event if it starts or ends in the window."""
+    uid = getattr(evt, "uid", None) or evt.summary or "?"
+    description = getattr(evt, "description", "") or ""
+    actions = parse_actions(description)
+    if not actions:
+        return
+
+    start = _comparable(evt.start)
+    end = _comparable(evt.end)
+
+    # Include the occurrence timestamp in the key so that different
+    # occurrences of the same recurring event (same UID) each get a
+    # unique deduplication entry.  Without the timestamp, the first
+    # occurrence would "burn" the key for all subsequent occurrences,
+    # silently preventing them from ever firing again in the same
+    # HA session.
+    start_key = f"{entry.entry_id}:{uid}:{start.isoformat()}:start"
+    if (
+        now - window <= start <= now
+        and start_key not in fired
+        and actions.get("on_start")
+    ):
+        await fire_actions(hass, actions["on_start"], evt.summary, "start")
+        fired[start_key] = now
+
+    stop_key = f"{entry.entry_id}:{uid}:{end.isoformat()}:stop"
+    if (
+        now - window <= end <= now
+        and stop_key not in fired
+        and actions.get("on_stop")
+    ):
+        await fire_actions(hass, actions["on_stop"], evt.summary, "stop")
+        fired[stop_key] = now

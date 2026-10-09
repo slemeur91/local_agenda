@@ -9,7 +9,7 @@ from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
 
 from .const import DOMAIN
-from .actions import parse_actions
+from .actions import parse_actions, set_actions_block
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -25,8 +25,6 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
     websocket_api.async_register_command(hass, ws_get_actions)
     websocket_api.async_register_command(hass, ws_set_actions)
     websocket_api.async_register_command(hass, ws_delete_event)
-    websocket_api.async_register_command(hass, ws_get_ha_services)
-    websocket_api.async_register_command(hass, ws_get_ha_entities)
 
 
 # ---------------------------------------------------------------------------
@@ -35,6 +33,7 @@ def async_register_websocket_api(hass: HomeAssistant) -> None:
 
 
 @callback
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {vol.Required("type"): "local_agenda/list_calendars"}
 )
@@ -63,6 +62,7 @@ def ws_list_calendars(
 # ---------------------------------------------------------------------------
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "local_agenda/get_events",
@@ -130,6 +130,7 @@ async def ws_get_events(
 # ---------------------------------------------------------------------------
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "local_agenda/get_actions",
@@ -169,6 +170,7 @@ async def ws_get_actions(
 # ---------------------------------------------------------------------------
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "local_agenda/set_actions",
@@ -183,13 +185,20 @@ async def ws_set_actions(
     connection: websocket_api.ActiveConnection,
     msg: dict,
 ) -> None:
-    """Write an actions block into an event's description and persist."""
-    import re
-    import yaml as _yaml
+    """Write an actions block into an event's description and persist.
 
+    The block is written to the master VEVENT and to every RECURRENCE-ID
+    override of the same UID.  An override carries its own copy of the
+    description, and it is that copy the scheduler reads for the occurrence
+    it replaces: leaving it out would keep the old actions running there.
+    """
     entry_id = msg["entry_id"]
     uid = msg["uid"]
-    new_actions: dict = msg["actions"]
+    new_actions: dict = {
+        phase: value
+        for phase, value in msg["actions"].items()
+        if phase in ("on_start", "on_stop") and value
+    }
 
     store = hass.data.get(DOMAIN, {}).get(entry_id, {}).get("store")
     if store is None:
@@ -197,44 +206,43 @@ async def ws_set_actions(
         return
 
     cal = store.get_calendar()
-    target = None
-    for component in cal.walk("VEVENT"):
-        if str(component.get("uid", "")) == uid and component.get("RECURRENCE-ID") is None:
-            target = component
-            break
-
-    if target is None:
+    targets = [
+        component
+        for component in cal.walk("VEVENT")
+        if str(component.get("uid", "")) == uid
+    ]
+    if not any(c.get("RECURRENCE-ID") is None for c in targets):
         connection.send_error(msg["id"], "not_found", f"Event {uid} not found")
         return
 
-    # Serialise new actions to YAML
-    actions_yaml = _yaml.dump(new_actions, allow_unicode=True, default_flow_style=False)
-    actions_block = f"---actions---\n{actions_yaml}---/actions---"
-
-    # Update description: replace existing block or append
-    description = str(target.get("description", "") or "")
-    block_re = re.compile(r"---actions---.*?---/actions---", re.DOTALL)
-    if block_re.search(description):
-        new_description = block_re.sub(actions_block, description).strip()
-    else:
-        sep = "\n\n" if description.strip() else ""
-        new_description = (description.strip() + sep + actions_block).strip()
-
-    target.pop("description", None)
-    if new_description:
-        target.add("description", new_description)
+    for target in targets:
+        description = str(target.get("description", "") or "")
+        new_description = set_actions_block(description, new_actions)
+        target.pop("description", None)
+        if new_description:
+            target.add("description", new_description)
 
     await store.async_save(hass)
+    await _refresh_entities(hass, entry_id)
 
-    # Refresh entities cache
+    connection.send_result(msg["id"], {"ok": True})
+
+
+async def _refresh_entities(hass: HomeAssistant, entry_id: str) -> None:
+    """Refresh the calendar entities of an entry and notify open panels.
+
+    See LocalAgendaEntity._notify_panel_updated() for why the panel needs
+    its own signal.
+    """
     for entity in hass.data.get(DOMAIN, {}).get(entry_id, {}).get("entities", []):
         try:
             await entity._refresh_next_event()
             entity.async_write_ha_state()
-        except Exception:
-            pass
-
-    connection.send_result(msg["id"], {"ok": True})
+            entity._notify_panel_updated()
+        except Exception as err:
+            _LOGGER.warning(
+                "local_agenda: could not refresh entity after an edit: %s", err
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -242,6 +250,7 @@ async def ws_set_actions(
 # ---------------------------------------------------------------------------
 
 
+@websocket_api.require_admin
 @websocket_api.websocket_command(
     {
         vol.Required("type"): "local_agenda/delete_event",
@@ -281,82 +290,9 @@ async def ws_delete_event(
 
     await store.async_save(hass)
 
-    # Refresh entities so HA state reflects the deletion immediately, and
-    # notify any open Local Agenda panel (this tab or another) so its event
-    # list refreshes too — see LocalAgendaEntity._notify_panel_updated().
-    for entity in hass.data.get(DOMAIN, {}).get(entry_id, {}).get("entities", []):
-        try:
-            await entity._refresh_next_event()
-            entity.async_write_ha_state()
-            entity._notify_panel_updated()
-        except Exception:
-            pass
+    await _refresh_entities(hass, entry_id)
 
     _LOGGER.debug(
         "local_agenda: deleted %d VEVENT component(s) for uid=%s", removed, uid
     )
     connection.send_result(msg["id"], {"ok": True, "removed": removed})
-
-
-# ---------------------------------------------------------------------------
-# get_ha_services
-# ---------------------------------------------------------------------------
-
-
-@callback
-@websocket_api.websocket_command(
-    {vol.Required("type"): "local_agenda/get_ha_services"}
-)
-def ws_get_ha_services(
-    hass: HomeAssistant,
-    connection: websocket_api.ActiveConnection,
-    msg: dict,
-) -> None:
-    """Return all registered HA services (domain + service name + fields schema)."""
-    result = []
-    for domain, services in hass.services.async_services().items():
-        for service_name, service_obj in services.items():
-            fields = {}
-            if hasattr(service_obj, "schema") and service_obj.schema is not None:
-                try:
-                    # Extract field names from voluptuous schema
-                    schema = service_obj.schema
-                    if hasattr(schema, "schema"):
-                        for key in schema.schema:
-                            field_name = str(key)
-                            fields[field_name] = {}
-                except Exception:
-                    pass
-            result.append(
-                {
-                    "domain": domain,
-                    "service": service_name,
-                    "full": f"{domain}.{service_name}",
-                    "fields": list(fields.keys()),
-                }
-            )
-    result.sort(key=lambda s: s["full"])
-    connection.send_result(msg["id"], result)
-
-
-# ---------------------------------------------------------------------------
-# get_ha_entities
-# ---------------------------------------------------------------------------
-
-
-@callback
-@websocket_api.websocket_command(
-    {vol.Required("type"): "local_agenda/get_ha_entities"}
-)
-def ws_get_ha_entities(
-    hass: HomeAssistant,
-    connection: websocket_api.ActiveConnection,
-    msg: dict,
-) -> None:
-    """Return all entity_ids with their current state."""
-    result = [
-        {"entity_id": state.entity_id, "state": state.state, "domain": state.domain}
-        for state in hass.states.async_all()
-    ]
-    result.sort(key=lambda e: e["entity_id"])
-    connection.send_result(msg["id"], result)

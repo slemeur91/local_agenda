@@ -2,18 +2,18 @@
   "config": {
     "step": {
       "user": {
-        "title": "Créer un agenda local",
-        "description": "Créez un agenda qui stocke les événements localement. Vous pourrez déclencher des services HA au début et à la fin de chaque événement via un bloc YAML dans la description.",
+        "title": "Create a Local Agenda calendar",
+        "description": "Create a calendar that stores its events locally. Home Assistant services can be called at the start and at the end of each event through a YAML block in its description.",
         "data": {
-          "calendar_name": "Nom de l'agenda"
+          "calendar_name": "Calendar name"
         }
       }
     },
     "error": {
-      "invalid_name": "Le nom de l'agenda ne peut pas être vide."
+      "invalid_name": "The calendar name cannot be empty."
     },
     "abort": {
-      "already_configured": "Un agenda avec ce nom existe déjà."
+      "already_configured": "A calendar with this name already exists."
     }
   }
 }

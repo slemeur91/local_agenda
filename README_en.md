@@ -132,7 +132,7 @@ on_start:
 | `and` | All sub-conditions are true. This is the default between conditions listed at the top level. |
 | `not` | None of the sub-conditions is true. |
 
-Quote values that YAML would read as something other than text: write `state: "on"`, not `state: on`. Conditions of an unknown type are permissive: they do not block execution and a warning is logged.
+Quote values that YAML would read as something other than text: write `state: "on"`, not `state: on`. A condition of an unknown type is treated as not met: it blocks execution and a warning is logged.
 
 <img src="images/en/modification-evenement-2.jpg" alt="An event and its actions block in the calendar" width="400">
 

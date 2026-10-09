@@ -3,11 +3,17 @@
     "step": {
       "user": {
         "title": "Create a Local Agenda calendar",
-        "description": "Create a calendar that can store events locally and trigger services on event start/end.",
+        "description": "Create a calendar that stores its events locally. Home Assistant services can be called at the start and at the end of each event through a YAML block in its description.",
         "data": {
           "calendar_name": "Calendar name"
         }
       }
+    },
+    "error": {
+      "invalid_name": "The calendar name cannot be empty."
+    },
+    "abort": {
+      "already_configured": "A calendar with this name already exists."
     }
   }
 }
