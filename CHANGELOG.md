@@ -3,6 +3,17 @@
 Les versions antérieures à la 1.2.0 sont décrites dans les
 [releases GitHub](https://github.com/slemeur91/local_agenda/releases).
 
+## 1.2.1 – 2026-10-09
+
+### Documentation
+
+- README simplifié : le détail de la syntaxe, les exemples et le
+  fonctionnement interne sont désormais dans le
+  [wiki du projet](https://github.com/slemeur91/local_agenda/wiki).
+- Ajout d'une version anglaise du README (`README_en.md`).
+- Captures d'écran refaites dans un format plus compact, avec des versions
+  anglaises dans `images/en/`.
+
 ## 1.2.0 – 2026-10-09
 
 ### Ajouts

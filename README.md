@@ -4,9 +4,9 @@
 [![hacs_badge](https://img.shields.io/badge/HACS-Custom-41BDF5.svg?style=flat-square)](https://github.com/hacs/integration)
 [![Maintainers](https://img.shields.io/badge/maintainers-@slemeur91-blue.svg?style=flat-square)](#)
 
-Un composant personnalisé pour Home Assistant qui étend l'intégration `local_calendar` en ajoutant la possibilité de déclencher des services Home Assistant au début et/ou à la fin d'événements.
+🇬🇧 [English version](README_en.md) · 📖 [Wiki du projet](https://github.com/slemeur91/local_agenda/wiki)
 
-📖 **Documentation détaillée : [wiki du projet](https://github.com/slemeur91/local_agenda/wiki)**
+Un composant personnalisé pour Home Assistant qui étend l'intégration `local_calendar` en ajoutant la possibilité de déclencher des services Home Assistant au début et/ou à la fin d'événements.
 
 ---
 
@@ -35,61 +35,15 @@ Cette clé garantit qu'une même action n'est jamais déclenchée deux fois, mê
 
 ---
 
-## Cas d'usage : gestion complète du chauffage
+## Cas d'usage : gestion du chauffage
 
-L'usage principal pour lequel cette intégration a été conçue est la **gestion du chauffage** pour deux zones indépendantes (Rez-de-chaussée et Étage), avec des horaires et des modes différents selon le type de journée.
+L'usage principal pour lequel cette intégration a été conçue est la **gestion du chauffage** de deux zones indépendantes (Rez-de-chaussée et Étage), avec des horaires différents selon le type de journée.
 
-### Organisation des agendas
+Cinq agendas suffisent : **Travail**, **TéléTravail**, **WE-Férié-Repos**, **Absent** et **Permanent**. Un seul agenda de type journée est actif à la fois ; les actions des agendas dont l'entité est désactivée sont ignorées.
 
-Cinq agendas `Local Agenda` sont créés :
+<img src="images/vue-5-integrations.jpg" alt="Les cinq agendas dans la page de l'intégration" width="600">
 
-| Agenda | Rôle |
-|---|---|
-| **Agenda Travail** | Horaires de chauffage les jours où vous partez au bureau |
-| **Agenda TéléTravail** | Horaires adaptés aux journées à domicile |
-| **Agenda WE-Férié-Repos** | Horaires détendus pour les week-ends et jours fériés |
-| **Agenda Absent** | Horaires hors-gel ou réduits lors des absences |
-| **Agenda Permanent** | Règles actives en permanence, quel que soit le mode |
-
-Un seul agenda de type journée est actif à la fois. Les entités des quatre agendas de type journée peuvent être **désactivées** dans le registre HA — les actions des agendas désactivés sont automatiquement ignorées par le scheduleur. L'Agenda Permanent est toujours actif.
-
-La sélection du mode actif se fait généralement via un `input_select` (ex. `input_select.calendrier`) dont les valeurs correspondent aux types de journée. Les événements utilisent des **conditions** sur cet `input_select` pour n'agir que quand le bon contexte est actif.
-
-![Vue des 5 intégrations Local Agenda](images/vue-5-integrations.png)
-
-![Le input_select.calendrier avec ses valeurs](images/input-select-calendrier.png)
-
-### Exemple concret : événement de chauffage RDC (condition multi-états)
-
-```
-Chauffage RDC - Confort matin semaine
-
----actions---
-on_start:
-  conditions:
-    - condition: or
-      conditions:
-        - condition: state
-          entity_id: input_select.calendrier
-          state: Travail
-        - condition: state
-          entity_id: input_select.calendrier
-          state: TéléTravail
-  actions:
-    - service: input_select.select_option
-      data:
-        option: Confort
-      target:
-        entity_id: input_select.chauffage_mode_rdc
-on_stop:
-  actions:
-    - service: input_select.select_option
-      data:
-        option: Réduit
-      target:
-        entity_id: input_select.chauffage_mode_rdc
----/actions---
-```
+Venant de Jeedom, il m'avait fallu 12 agendas et 7 automatisations pour obtenir le même résultat avec le calendrier natif. Le détail est dans le wiki : [Pourquoi cette intégration ?](https://github.com/slemeur91/local_agenda/wiki/Pourquoi-cette-integration) et [Cas d'usage : le chauffage](https://github.com/slemeur91/local_agenda/wiki/Cas-d-usage-chauffage).
 
 ---
 
@@ -105,125 +59,25 @@ on_stop:
 2. Redémarrez Home Assistant.
 3. **Paramètres → Appareils et services → Ajouter une intégration → Local Agenda**.
 
----
-
-## Créer un agenda via l'interface HA
-
-1. Allez dans **Paramètres → Appareils et services**.
-2. Cliquez sur **+ Ajouter une intégration** et cherchez **Local Agenda**.
-3. Saisissez le nom de l'agenda (ex. `Agenda Travail`). Ce nom apparaîtra dans la barre latérale du calendrier HA et dans le panneau Local Agenda.
-4. Cliquez sur **Envoyer**. L'agenda est créé et son entité calendrier est disponible immédiatement.
-
-![Boîte de dialogue de création d'un agenda](images/boite-dialogue-creation.png)
-
-![Agenda créé et disponible](images/agenda-cree.png)
+Home Assistant 2026.4.0 ou plus récent est requis.
 
 ---
 
-## Créer et éditer des événements via le calendrier HA
+## Prise en main
 
-### Accès au calendrier
+### 1. Créer un agenda
 
-Dans la barre latérale de HA, cliquez sur **Calendrier**. Vos agendas Local Agenda apparaissent dans la liste à gauche avec une case à cocher pour les afficher ou les masquer.
+Dans **Paramètres → Appareils et services**, ajoutez l'intégration **Local Agenda** et donnez un nom à l'agenda. Répétez l'opération pour chaque agenda.
 
-### Créer un événement
+<img src="images/boite-dialogue-creation.jpg" alt="Boîte de dialogue de création d'un agenda" width="400">
 
-1. Cliquez sur un créneau horaire dans la vue calendrier (ou sur le bouton **+ Créer un événement**).
-2. Renseignez le **titre** de l'événement.
-3. Choisissez l'**agenda de destination** dans le sélecteur de calendrier.
-4. Configurez les heures de début et de fin (des heures précises, pas "toute la journée").
-5. Dans le champ **Description**, ajoutez votre texte libre puis le bloc `---actions---` (voir syntaxe ci-dessous).
-6. Configurez la **récurrence** si besoin (quotidienne, hebdomadaire avec sélection des jours, etc.).
-7. Cliquez sur **Créer**.
+### 2. Créer un événement
 
-![Création d'un événement avec bloc actions](images/creation-evenement.png)
+Dans la vue **Calendrier** de Home Assistant, créez un événement dans votre agenda, avec des heures précises et une récurrence si besoin.
 
-### Modifier un événement existant
+### 3. Ajouter les actions dans la description
 
-Cliquez sur un événement dans le calendrier, puis sur le crayon ✏️. Le champ Description affiche le contenu complet, y compris le bloc YAML. Modifiez puis sauvegardez.
-
-![Modification d'un événement - vue 1](images/modification-evenement-1.png)
-
-![Modification d'un événement - vue 2](images/modification-evenement-2.png)
-
----
-
-## Création et modification des actions
-
-Les actions peuvent être définies de deux façons :
-
-- **Directement dans la description de l'événement** via le calendrier HA, en saisissant manuellement le bloc YAML `---actions---` (méthode recommandée).
-- **Via le panneau Local Agenda** accessible depuis le menu de HA, qui propose un éditeur intégré (fonctionnalité en cours d'épreuve).
-
-### Syntaxe des actions
-
-Les événements peuvent inclure un bloc spécial `---actions---` dans leur description pour définir les services à déclencher. Le bloc utilise la syntaxe YAML.
-
-#### Format simple (sans conditions)
-
-```
----actions---
-on_start:
-  actions:
-    - service: domaine.nom_du_service
-      data: {}
-      target:
-        entity_id:
-          - switch.mon_interrupteur
-on_stop:
-  actions:
-    - service: domaine.nom_du_service
-      data: {}
-      target:
-        entity_id:
-          - switch.mon_interrupteur
----/actions---
-```
-
-#### Format avec conditions
-
-```
----actions---
-on_start:
-  conditions:
-    - condition: state
-      entity_id: input_select.nom_de_la_condition
-      state: Etat
-  actions:
-    - service: domaine.nom_du_service
-      data: {}
-      target:
-        entity_id:
-          - switch.mon_interrupteur
-on_stop:
-  actions:
-    - service: domaine.nom_du_service
-      data: {}
-      target:
-        entity_id:
-          - switch.mon_interrupteur
----/actions---
-```
-
-`on_start` et `on_stop` sont tous deux optionnels. Chaque appel de service prend en charge :
-
-- `service` : **Obligatoire.** Format `domaine.nom_du_service` (ex. `switch.turn_on`).
-- `target` : Optionnel. Dictionnaire avec `entity_id` ou d'autres informations de ciblage.
-- `data` : Optionnel. Paramètres supplémentaires du service.
-- `entity_id` : Optionnel. Raccourci pour `target: {entity_id: ...}`.
-
-#### Types de conditions supportés
-
-| Type | Description |
-|---|---|
-| `state` | Vérifie l'état d'une entité. `state` peut être une chaîne ou une liste de valeurs. |
-| `or` | Au moins une des sous-conditions doit être vraie. |
-| `and` | Toutes les sous-conditions doivent être vraies (comportement par défaut si plusieurs conditions sont listées au même niveau). |
-| `not` | Aucune des sous-conditions ne doit être vraie. |
-
-Les conditions de type inconnu sont **permissives** : elles ne bloquent pas l'exécution et génèrent un avertissement dans les logs.
-
-#### Exemple 1 : Allumer un interrupteur au début, éteindre à la fin
+Le bloc `---actions---` de la description indique quoi faire au début (`on_start`) et à la fin (`on_stop`) de l'événement. Les deux sont facultatifs.
 
 ```
 Session d'arrosage de la pelouse
@@ -233,163 +87,62 @@ on_start:
   actions:
     - service: switch.turn_on
       target:
-        entity_id:
-          - switch.arrosage_pelouse
+        entity_id: switch.arrosage_pelouse
 on_stop:
   actions:
     - service: switch.turn_off
       target:
-        entity_id:
-          - switch.arrosage_pelouse
+        entity_id: switch.arrosage_pelouse
 ---/actions---
 ```
 
-#### Exemple 2 : Démarrer les aspirateurs robots
+Une phase peut être soumise à des conditions (`state`, `or`, `and`, `not`) :
 
 ```
-Passage des aspirateurs
-
----actions---
-on_start:
-  actions:
-    - service: vacuum.start
-      target:
-        entity_id:
-          - vacuum.aspirateur_du_bas
-          - vacuum.aspirateur_de_l_etage
----/actions---
-```
-
-#### Exemple 3 : Activer le mode hors-gel
-
-```
-Activation du Chauffage Hors Gel
-
----actions---
-on_start:
-  actions:
-    - service: input_boolean.turn_on
-      target:
-        entity_id:
-          - input_boolean.chauffage_horsgel
----/actions---
-```
-
-#### Exemple 4 : Chauffage conditionnel selon le mode de journée
-
-```
-Positionnement du Chauffage du Rez De Chaussée en Réduit
-Appliqué uniquement lorsque le calendrier est sur Absent
-
 ---actions---
 on_start:
   conditions:
     - condition: state
       entity_id: input_select.calendrier
-      state: Absent
-  actions:
-    - service: input_select.select_option
-      data:
-        option: Réduit
-      target:
-        entity_id:
-          - input_select.chauffage_mode_rdc
----/actions---
-```
-
-#### Exemple 5 : 2 conditions et 2 actions (Travail OU TéléTravail, RDC et Étage)
-
-```
-Chauffage RDC et Étage Confort - Matin semaine
-
----actions---
-on_start:
-  conditions:
-    - condition: or
-      conditions:
-        - condition: state
-          entity_id: input_select.calendrier
-          state: Travail
-        - condition: state
-          entity_id: input_select.calendrier
-          state: TéléTravail
+      state:
+        - Travail
+        - TéléTravail
   actions:
     - service: input_select.select_option
       data:
         option: Confort
       target:
-        entity_id:
-          - input_select.chauffage_mode_rdc
-    - service: input_select.select_option
-      data:
-        option: Confort
-      target:
-        entity_id:
-          - input_select.chauffage_mode_etage
-on_stop:
-  actions:
-    - service: input_select.select_option
-      data:
-        option: Réduit
-      target:
-        entity_id:
-          - input_select.chauffage_mode_rdc
-    - service: input_select.select_option
-      data:
-        option: Réduit
-      target:
-        entity_id:
-          - input_select.chauffage_mode_etage
+        entity_id: input_select.chauffage_mode_rdc
 ---/actions---
 ```
 
-### Panneau Local Agenda du menu HA
+<img src="images/modification-evenement-2.jpg" alt="Un événement et son bloc d'actions dans le calendrier" width="400">
 
-> ⚠️ **Note** : Ce panneau a été développé en dernier et n'a pas encore été complètement éprouvé. Il peut présenter des comportements inattendus. La méthode recommandée et fiable pour éditer les actions reste la saisie directe du bloc YAML dans le champ Description de l'événement via le calendrier HA.
-
-Une fois l'intégration installée, une entrée **Local Agenda** apparaît automatiquement dans la barre latérale de HA (icône calendrier avec crayon). Ce panneau offre une vue centralisée pour consulter et modifier les actions de tous vos agendas sans passer par l'éditeur d'événements du calendrier HA.
-
-Un menu déroulant liste tous les agendas existants. La sélection d'un agenda affiche ses événements triés par date de début, avec un indicateur visuel signalant la présence d'un bloc d'actions. Cliquez sur un événement pour ouvrir l'éditeur YAML du bloc `---actions---` directement dans l'interface. La sauvegarde met à jour la description de l'événement dans le fichier ICS et rafraîchit immédiatement l'entité calendrier dans HA.
-
-![Panneau Local Agenda - Éditeur d'actions](images/interface-local-agenda.png)
+La syntaxe complète est décrite dans le wiki : [Syntaxe des actions](https://github.com/slemeur91/local_agenda/wiki/Syntaxe-des-actions), [Conditions](https://github.com/slemeur91/local_agenda/wiki/Conditions) et [Exemples](https://github.com/slemeur91/local_agenda/wiki/Exemples).
 
 ---
 
-## Fonctionnement interne
+## Panneau Local Agenda
 
-### Scheduleur
+Une entrée **Local Agenda** s'ajoute à la barre latérale de Home Assistant. Ce panneau permet de modifier les conditions et les appels de service d'un événement avec un formulaire, sans écrire le YAML à la main. Les badges **remplie / non remplie** indiquent en direct si une condition est satisfaite.
 
-Le composant enregistre un timer via `async_track_time_interval` qui se déclenche toutes les **20 secondes**. À chaque tick, il parcourt tous les événements de tous les agendas actifs dans une fenêtre glissante de **±22 secondes** autour du moment présent :
+<img src="images/panneau-condition.jpg" alt="Panneau Local Agenda : une condition dépliée" width="800">
 
-- Si l'heure de **début** d'un événement tombe dans la fenêtre → les actions `on_start` sont exécutées.
-- Si l'heure de **fin** d'un événement tombe dans la fenêtre → les actions `on_stop` sont exécutées.
+> ⚠️ Ce panneau est récent et n'a pas encore été complètement éprouvé. La méthode de référence reste la saisie du bloc YAML dans la description de l'événement.
 
-### Stockage
-
-Les événements sont stockés dans `.storage/local_agenda_{nom_de_lagenda}.ics`, indépendamment du stockage de l'intégration native `local_calendar`, pour éviter tout conflit.
-
-### API WebSocket (utilisée par le panneau)
-
-Le panneau Local Agenda communique avec HA via des commandes WebSocket dédiées :
-
-| Commande | Rôle |
-|---|---|
-| `local_agenda/list_calendars` | Liste tous les agendas créés |
-| `local_agenda/get_events` | Retourne les événements d'un agenda (uniquement les événements maîtres, hors overrides récurrents) |
-| `local_agenda/get_actions` | Lit le bloc d'actions d'un événement spécifique |
-| `local_agenda/set_actions` | Écrit/met à jour le bloc d'actions dans la description et sauvegarde le fichier ICS |
-| `local_agenda/get_ha_services` | Retourne tous les services HA disponibles (pour l'éditeur) |
-| `local_agenda/get_ha_entities` | Retourne toutes les entités HA avec leur état courant (pour l'éditeur) |
+Voir [Panneau Local Agenda](https://github.com/slemeur91/local_agenda/wiki/Panneau-Local-Agenda) dans le wiki.
 
 ---
 
 ## Limitations
 
-- La granularité d'interrogation est de 20 secondes ; les actions se déclenchent avec une précision d'environ ±20 secondes.
-- La déduplication est **en mémoire** : si Home Assistant redémarre en cours d'événement, les actions peuvent être rejouées si la fenêtre de ±22 s est de nouveau satisfaite au redémarrage.
-- Si Home Assistant est hors ligne lors d'une transition d'événement, le déclenchement rétroactif n'a pas lieu.
-- Les heures des événements doivent être des **heures précises** (pas des événements "toute la journée") pour que les déclenchements fonctionnent correctement.
-- Les événements récurrents fonctionnent ; les remplacements spécifiques à une occurrence (exception RECURRENCE-ID) sont ignorés dans le panneau (seuls les événements maîtres sont affichés).
+- Les actions partent avec une précision d'une vingtaine de secondes.
+- Si Home Assistant est arrêté lors d'un début ou d'une fin d'événement, l'action n'est pas rattrapée.
+- La déduplication est en mémoire : une action peut être rejouée si Home Assistant redémarre juste après une transition.
+- Les événements doivent avoir des heures précises, pas « toute la journée ».
+- Seules les conditions `state`, `or`, `and` et `not` sont prises en charge.
+
+La liste complète est dans [Limitations](https://github.com/slemeur91/local_agenda/wiki/Limitations).
 
 ---
 
@@ -417,6 +170,18 @@ logger:
     custom_components.local_agenda: debug
 ```
 
+---
+
+## Documentation
+
+| Sujet | Page du wiki |
+|---|---|
+| Créer un agenda, créer et modifier des événements | [Créer un agenda](https://github.com/slemeur91/local_agenda/wiki/Creer-un-agenda) · [Événements](https://github.com/slemeur91/local_agenda/wiki/Creer-et-modifier-des-evenements) |
+| Écrire les actions et les conditions | [Syntaxe des actions](https://github.com/slemeur91/local_agenda/wiki/Syntaxe-des-actions) · [Conditions](https://github.com/slemeur91/local_agenda/wiki/Conditions) · [Exemples](https://github.com/slemeur91/local_agenda/wiki/Exemples) |
+| Scheduleur, stockage, API WebSocket | [Fonctionnement interne](https://github.com/slemeur91/local_agenda/wiki/Fonctionnement-interne) |
+| Une action ne se déclenche pas, activer les logs | [Dépannage et logs](https://github.com/slemeur91/local_agenda/wiki/Depannage-et-logs) |
+
+Historique des versions : [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
