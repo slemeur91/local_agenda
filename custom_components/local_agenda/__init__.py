@@ -121,15 +121,21 @@ async def _check_actions(hass: HomeAssistant, entry: ConfigEntry) -> None:
     now = dt_util.utcnow()
     window = timedelta(seconds=22)
 
-    # Per-entry deduplication set (lives for the duration of the HA session).
-    # Purge keys older than 10 minutes each tick to prevent unbounded growth
-    # on long-running HA instances with many recurring events.  10 minutes is
-    # safely above the 22-second firing window, so no valid key is evicted.
-    fired: set[str] = hass.data[DOMAIN].setdefault(
-        entry.entry_id + "_fired", set()
+    # Per-entry deduplication map: key -> UTC datetime at which it fired
+    # (lives for the duration of the HA session).
+    # Purge keys fired more than 10 minutes ago each tick to prevent unbounded
+    # growth on long-running HA instances with many recurring events.  10
+    # minutes is safely above the 22-second firing window, so no valid key is
+    # evicted.  The purge relies on the stored datetime, never on the key
+    # text: the key embeds an ISO timestamp (and possibly a UID) containing
+    # ":" and expressed in the event's own timezone, so it cannot be parsed
+    # or compared reliably.
+    fired: dict[str, datetime] = hass.data[DOMAIN].setdefault(
+        entry.entry_id + "_fired", {}
     )
-    cutoff = (now - timedelta(minutes=10)).isoformat()
-    fired -= {k for k in fired if k.split(":")[2] < cutoff}
+    cutoff = now - timedelta(minutes=10)
+    for key in [k for k, fired_at in fired.items() if fired_at < cutoff]:
+        del fired[key]
     entities = hass.data[DOMAIN].get(entry.entry_id, {}).get("entities", [])
 
     for entity in entities:
@@ -180,7 +186,7 @@ async def _check_actions(hass: HomeAssistant, entry: ConfigEntry) -> None:
                 and actions.get("on_start")
             ):
                 await fire_actions(hass, actions["on_start"], evt.summary, "start")
-                fired.add(start_key)
+                fired[start_key] = now
 
             stop_key = f"{entry.entry_id}:{uid}:{end_iso}:stop"
             if (
@@ -189,4 +195,4 @@ async def _check_actions(hass: HomeAssistant, entry: ConfigEntry) -> None:
                 and actions.get("on_stop")
             ):
                 await fire_actions(hass, actions["on_stop"], evt.summary, "stop")
-                fired.add(stop_key)
+                fired[stop_key] = now

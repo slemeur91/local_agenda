@@ -2,7 +2,7 @@
 // Vanilla JS custom element, no build step required.
 // Registered automatically by the integration via async_register_built_in_panel.
 
-const VERSION = "1.8.2";
+const VERSION = "1.9.0";
 console.info(`%c[local_agenda] panel.js v${VERSION} loaded`, "color:#03a9f4;font-weight:bold;");
 
 // ---------------------------------------------------------------------------
@@ -103,10 +103,31 @@ const STYLES = `
 /* Conditions block */
 .cond-block { background: var(--secondary-background-color, #f5f5f5); border-radius: 6px; padding: 12px 16px; border: 1px solid var(--divider-color, #e0e0e0); }
 .cond-block-title { font-size: 13px; font-weight: 600; color: var(--secondary-text-color); margin-bottom: 10px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.cond-block-title-left { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; cursor: pointer; }
-.cond-block.collapsed .cond-list { display: none; }
+.cond-block-title-left { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 0; flex-wrap: wrap; }
+.cond-op-sel { width: 70px; padding: 4px 6px; font-size: 13px; }
 .cond-list { display: flex; flex-direction: column; gap: 8px; }
-.cond-row { display: flex; align-items: center; gap: 8px; background: var(--card-background-color, #fff); border-radius: 4px; padding: 8px 10px; border: 1px solid var(--divider-color, #e0e0e0); }
+.cond-list:empty { display: none; }
+.cond-card { background: var(--card-background-color, #fff); border-radius: 4px; border: 1px solid var(--divider-color, #e0e0e0); }
+.cond-card-header { display: flex; align-items: center; gap: 8px; padding: 6px 10px; }
+.cond-card-header-left { display: flex; align-items: center; gap: 6px; flex: 1; min-width: 0; cursor: pointer; }
+.cond-card-summary { font-size: 13px; color: var(--primary-text-color); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cond-card.collapsed .cond-card-body { display: none; }
+.cond-card-body { padding: 4px 12px 12px; display: flex; flex-direction: column; gap: 10px; }
+.cond-form-row { display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 10px; }
+.cond-current { font-size: 12px; color: var(--secondary-text-color); margin-top: 4px; }
+.state-chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.state-chip { background: transparent; border: 1px solid var(--divider-color, #aaa); color: var(--primary-text-color); font-size: 12px; padding: 5px 10px; }
+.state-chip.selected { background: var(--primary-color, #03a9f4); border-color: var(--primary-color, #03a9f4); color: #fff; }
+.cond-add-state { display: flex; align-items: center; gap: 8px; margin-top: 8px; }
+.cond-add-state input[type=text] { width: 200px; }
+.cond-raw { margin: 0; font-family: monospace; font-size: 12px; white-space: pre-wrap; color: var(--primary-text-color); background: var(--secondary-background-color, #f5f5f5); border-radius: 4px; padding: 8px 10px; }
+
+/* "remplie / non remplie" badges */
+.cond-status { font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 12px; flex-shrink: 0; white-space: nowrap; }
+.cond-status:empty { display: none; }
+.cond-status.ok { background: #e8f5e9; color: #2e7d32; }
+.cond-status.ko { background: #fce4ec; color: #c62828; }
+.cond-status.warn { background: #fff8e1; color: #b26a00; }
 
 /* Action rows */
 .action-card { border: 1px solid var(--divider-color, #e0e0e0); border-radius: 6px; overflow: visible; margin-bottom: 4px; }
@@ -420,34 +441,155 @@ function readDataRows(container) {
 }
 
 // ---------------------------------------------------------------------------
-// Condition row
+// Condition cards
 // ---------------------------------------------------------------------------
-function makeCondRow(cond, entityList = [], orderVal = 0) {
-  const row = document.createElement("div");
-  row.className = "cond-row";
-  row.dataset.order = String(orderVal);
+// The form only produces what actions.py knows how to evaluate: a `state`
+// condition on one entity with one or several expected states, optionally
+// wrapped in `not` ("n'est pas"). Anything else found in an event (nested
+// and/or, extra keys, non-text states, …) is kept verbatim in a read-only
+// card, so saving from the panel never drops a hand-written condition.
 
-  const typeEl = document.createElement("select");
-  typeEl.className = "cond-type-sel";
-  typeEl.style.cssText = "width:110px;flex-shrink:0;";
-  [{ v: "state", l: "État" }].forEach(({ v, l }) => {
-    const o = document.createElement("option"); o.value = v; o.textContent = l;
-    if (cond.condition === v) o.selected = true;
-    typeEl.appendChild(o);
-  });
+// States offered as buttons when the entity itself doesn't list its options.
+const DOMAIN_STATES = {
+  binary_sensor: ["on", "off"],
+  switch: ["on", "off"],
+  light: ["on", "off"],
+  fan: ["on", "off"],
+  input_boolean: ["on", "off"],
+  automation: ["on", "off"],
+  script: ["on", "off"],
+  siren: ["on", "off"],
+  humidifier: ["on", "off"],
+  remote: ["on", "off"],
+  person: ["home", "not_home"],
+  device_tracker: ["home", "not_home"],
+  cover: ["open", "closed", "opening", "closing"],
+  valve: ["open", "closed", "opening", "closing"],
+  lock: ["locked", "unlocked"],
+  sun: ["above_horizon", "below_horizon"],
+  vacuum: ["cleaning", "docked", "paused", "idle", "returning", "error"],
+  media_player: ["playing", "paused", "idle", "off", "on", "standby"],
+  timer: ["active", "paused", "idle"],
+};
 
-  // Filterable entity input
-  const { wrapper: entityWrapper, input: entityInput } = makeFilterableInput({
-    placeholder: "entity_id",
-    value: cond.entity_id || "",
-    options: entityList,
-    className: "cond-entity-input",
-  });
-  entityWrapper.style.flex = "1";
+function isPlainObject(v) {
+  return v !== null && typeof v === "object" && !Array.isArray(v);
+}
 
-  const stateEl = document.createElement("input");
-  stateEl.type = "text"; stateEl.placeholder = "état attendu"; stateEl.value = cond.state || "";
-  stateEl.style.width = "120px"; stateEl.style.flexShrink = "0";
+function hasOnlyKeys(obj, allowed) {
+  return Object.keys(obj).every(k => allowed.includes(k));
+}
+
+// True for `{condition: or, conditions: [...]}` with nothing else — the shape
+// the "OU" selector reads and writes.
+function isOrWrapper(cond) {
+  return isPlainObject(cond) && cond.condition === "or" &&
+    hasOnlyKeys(cond, ["condition", "conditions"]) && Array.isArray(cond.conditions);
+}
+
+/**
+ * Turns a stored condition into the form model {entity, states, negate},
+ * or returns null when the form can't represent it faithfully.
+ */
+function parseSimpleCond(cond) {
+  if (!isPlainObject(cond)) return null;
+  let c = cond;
+  let negate = false;
+  if (c.condition === "not") {
+    if (!hasOnlyKeys(c, ["condition", "conditions"]) ||
+        !Array.isArray(c.conditions) || c.conditions.length !== 1) return null;
+    negate = true;
+    c = c.conditions[0];
+    if (!isPlainObject(c)) return null;
+  }
+  if (c.condition !== "state" || !hasOnlyKeys(c, ["condition", "entity_id", "state"])) return null;
+  if (typeof c.entity_id !== "string") return null;
+  let states;
+  if (Array.isArray(c.state)) states = c.state;
+  else if (c.state === undefined || c.state === "") states = [];
+  else states = [c.state];
+  // Unquoted YAML such as `state: on` or `state: 5` arrives as a boolean or
+  // a number; the form would silently turn it into different text.
+  if (states.some(s => typeof s !== "string")) return null;
+  return { entity: c.entity_id, states: states.slice(), negate };
+}
+
+// Python's str() for the scalar types YAML can yield — the backend compares
+// the entity state with str(expected).
+function pyStr(v) {
+  if (v === true) return "True";
+  if (v === false) return "False";
+  if (v === null || v === undefined) return "None";
+  return String(v);
+}
+
+// Mirrors _check_single_condition() in actions.py, so the "remplie" badges
+// show what the scheduler would decide right now.
+function evalCondition(cond, states) {
+  if (!isPlainObject(cond)) return false;
+  const subs = Array.isArray(cond.conditions) ? cond.conditions : [];
+  switch (cond.condition) {
+    case "state": {
+      const st = states[cond.entity_id];
+      if (!st) return false;
+      if (Array.isArray(cond.state)) return cond.state.includes(st.state);
+      return st.state === pyStr(cond.state);
+    }
+    case "or": return subs.some(s => evalCondition(s, states));
+    case "and": return subs.every(s => evalCondition(s, states));
+    case "not": return !subs.some(s => evalCondition(s, states));
+    default: return true; // the backend lets unknown condition types pass
+  }
+}
+
+function knownStates(entityId, stateObj) {
+  const attrs = (stateObj && stateObj.attributes) || {};
+  const domain = (entityId || "").split(".")[0];
+  let list = [];
+  if (Array.isArray(attrs.options)) list = attrs.options.map(String);
+  else if (domain === "climate" && Array.isArray(attrs.hvac_modes)) list = attrs.hvac_modes.map(String);
+  else if (DOMAIN_STATES[domain]) list = DOMAIN_STATES[domain].slice();
+  if (stateObj && typeof stateObj.state === "string" && !list.includes(stateObj.state)) list.push(stateObj.state);
+  return list;
+}
+
+function setStatus(el, kind, text) {
+  el.className = "cond-status" + (kind ? " " + kind : "");
+  el.textContent = text;
+}
+
+/**
+ * One condition card. `getStates` returns the live hass.states map.
+ * The card exposes, for makePhaseBlock / readPhaseBlock:
+ *   card._laRead()    → the condition to store, or null for a blank card
+ *   card._laError()   → a message when the card is half filled, else null
+ *   card._laRefresh() → re-reads the live states (current value + badge)
+ */
+function makeCondCard(cond, entityList = [], orderVal = 0, getStates = () => ({}), startCollapsed = false) {
+  const isNew = !cond || Object.keys(cond).length === 0;
+  const model = isNew ? { entity: "", states: [], negate: false } : parseSimpleCond(cond);
+
+  const card = document.createElement("div");
+  card.className = "cond-card";
+  card.dataset.order = String(orderVal);
+
+  const hdr = document.createElement("div");
+  hdr.className = "cond-card-header";
+
+  const collapseBtn = document.createElement("button");
+  collapseBtn.type = "button";
+  collapseBtn.className = "btn-collapse";
+  collapseBtn.title = "Déplier / replier";
+
+  const summarySpan = document.createElement("span");
+  summarySpan.className = "cond-card-summary";
+
+  const headerLeft = document.createElement("div");
+  headerLeft.className = "cond-card-header-left";
+  headerLeft.append(collapseBtn, summarySpan);
+
+  const statusSpan = document.createElement("span");
+  statusSpan.className = "cond-status";
 
   const orderBtns = document.createElement("div");
   orderBtns.className = "order-btns";
@@ -459,23 +601,182 @@ function makeCondRow(cond, entityList = [], orderVal = 0) {
 
   const del = document.createElement("button");
   del.type = "button";
-  del.className = "btn-icon btn-delete-cond"; del.textContent = "✕";
+  del.className = "btn-icon btn-delete-cond"; del.textContent = "🗑"; del.title = "Supprimer la condition";
   // .remove() / reorder side-effects are wired from makePhaseBlock.
 
-  row.append(orderBtns, typeEl, entityWrapper, stateEl, del);
-  return row;
-}
+  hdr.append(headerLeft, statusSpan, orderBtns, del);
 
-function readCondRow(row) {
-  // entity input is inside .la-autocomplete wrapper — querySelector still reaches it
-  const entityInput = row.querySelector(".cond-entity-input");
-  const stateEl = row.querySelectorAll("input[type=text]");
-  // stateEl[0] is entity (inside wrapper), stateEl[1] is the plain state input
-  return {
-    condition: row.querySelector(".cond-type-sel").value,
-    entity_id: entityInput ? entityInput.value.trim() : (stateEl[0] ? stateEl[0].value.trim() : ""),
-    state: stateEl[1] ? stateEl[1].value.trim() : "",
-  };
+  const body = document.createElement("div");
+  body.className = "cond-card-body";
+
+  function setCollapsed(collapsed) {
+    card.classList.toggle("collapsed", collapsed);
+    collapseBtn.textContent = collapsed ? "▸" : "▾";
+  }
+  headerLeft.onclick = () => setCollapsed(!card.classList.contains("collapsed"));
+  setCollapsed(startCollapsed);
+
+  card.append(hdr, body);
+
+  // ---- Hand-written condition the form can't represent: shown as is ----
+  if (!model) {
+    summarySpan.textContent = "Condition avancée (non modifiable ici)";
+    const pre = document.createElement("pre");
+    pre.className = "cond-raw";
+    try { pre.textContent = toYaml(cond); } catch (e) { pre.textContent = JSON.stringify(cond, null, 2); }
+    const hint = document.createElement("div");
+    hint.className = "data-hint";
+    hint.textContent = "Écrite à la main dans la description de l'événement : elle est conservée telle quelle à la sauvegarde.";
+    body.append(pre, hint);
+
+    card._laRead = () => cond;
+    card._laError = () => null;
+    card._laRefresh = () => {
+      const met = evalCondition(cond, getStates());
+      setStatus(statusSpan, met ? "ok" : "ko", met ? "remplie" : "non remplie");
+    };
+    card._laRefresh();
+    return card;
+  }
+
+  // ---- Form: entity + comparison ----
+  const formRow = document.createElement("div");
+  formRow.className = "cond-form-row";
+
+  const entityGroup = document.createElement("div");
+  const entityLabel = document.createElement("label"); entityLabel.textContent = "Entité";
+  const { wrapper: entityWrapper, input: entityInput } = makeFilterableInput({
+    placeholder: "entity_id",
+    value: model.entity,
+    options: entityList,
+    className: "cond-entity-input",
+  });
+  const currentEl = document.createElement("div");
+  currentEl.className = "cond-current";
+  entityGroup.append(entityLabel, entityWrapper, currentEl);
+
+  const compareGroup = document.createElement("div");
+  const compareLabel = document.createElement("label"); compareLabel.textContent = "Comparaison";
+  const compareSel = document.createElement("select");
+  compareSel.className = "cond-compare-sel";
+  [{ v: "is", l: "est" }, { v: "is_not", l: "n'est pas" }].forEach(({ v, l }) => {
+    const o = document.createElement("option"); o.value = v; o.textContent = l;
+    compareSel.appendChild(o);
+  });
+  compareSel.value = model.negate ? "is_not" : "is";
+  compareGroup.append(compareLabel, compareSel);
+
+  formRow.append(entityGroup, compareGroup);
+
+  // ---- States: multi-select buttons + free entry ----
+  const statesGroup = document.createElement("div");
+  const statesLabel = document.createElement("label"); statesLabel.textContent = "États (choix multiple)";
+  const chips = document.createElement("div");
+  chips.className = "state-chips";
+  const addRow = document.createElement("div");
+  addRow.className = "cond-add-state";
+  const otherInput = document.createElement("input");
+  otherInput.type = "text"; otherInput.placeholder = "Autre état";
+  const addBtn = document.createElement("button");
+  addBtn.type = "button"; addBtn.className = "btn-secondary"; addBtn.textContent = "Ajouter";
+  addRow.append(otherInput, addBtn);
+  statesGroup.append(statesLabel, chips, addRow);
+
+  body.append(formRow, statesGroup);
+
+  const selected = model.states.slice();
+  const entityId = () => entityInput.value.trim();
+  const notifyChanged = () => card.dispatchEvent(new Event("change", { bubbles: true }));
+
+  function renderChips() {
+    const e = entityId();
+    const list = knownStates(e, getStates()[e]);
+    selected.forEach(s => { if (!list.includes(s)) list.push(s); });
+    chips.innerHTML = "";
+    if (!list.length) {
+      const empty = document.createElement("span");
+      empty.className = "data-hint";
+      empty.textContent = e ? "Aucun état connu pour cette entité : ajoutez-le ci-dessous." : "Choisissez d'abord une entité.";
+      chips.appendChild(empty);
+      return;
+    }
+    list.forEach(s => {
+      const chip = document.createElement("button");
+      chip.type = "button";
+      chip.className = "state-chip" + (selected.includes(s) ? " selected" : "");
+      chip.textContent = s;
+      chip.onclick = () => {
+        const i = selected.indexOf(s);
+        if (i === -1) selected.push(s); else selected.splice(i, 1);
+        renderChips();
+        refresh();
+        notifyChanged();
+      };
+      chips.appendChild(chip);
+    });
+  }
+
+  function commitOther() {
+    const v = otherInput.value.trim();
+    if (!v) return;
+    otherInput.value = "";
+    if (!selected.includes(v)) selected.push(v);
+    renderChips();
+    refresh();
+    notifyChanged();
+  }
+  // "change" fires on Enter and on blur, so a state typed but not yet added
+  // is picked up before a click on "Sauvegarder" is handled.
+  otherInput.addEventListener("change", (ev) => { ev.stopPropagation(); commitOther(); });
+  addBtn.onclick = commitOther;
+
+  function read() {
+    const e = entityId();
+    if (!e && !selected.length) return null;
+    const c = { condition: "state", entity_id: e, state: selected.length === 1 ? selected[0] : selected.slice() };
+    return compareSel.value === "is_not" ? { condition: "not", conditions: [c] } : c;
+  }
+
+  function error() {
+    const e = entityId();
+    if (!e && !selected.length) return null;
+    if (!e) return "choisissez une entité";
+    if (!selected.length) return "choisissez au moins un état";
+    return null;
+  }
+
+  function refresh() {
+    const e = entityId();
+    const st = getStates()[e];
+    const name = (st && st.attributes && st.attributes.friendly_name) || e;
+    if (st) currentEl.textContent = `${name} · actuellement : ${st.state}`;
+    else currentEl.textContent = e ? "Entité inconnue de Home Assistant" : "";
+
+    const verb = compareSel.value === "is_not" ? "n'est pas" : "est";
+    summarySpan.textContent = e || selected.length
+      ? `${name || "(entité non définie)"} ${verb} ${selected.join(", ") || "(état non défini)"}`
+      : "Nouvelle condition";
+
+    if (!e && !selected.length) setStatus(statusSpan, "", "");
+    else if (error()) setStatus(statusSpan, "warn", "incomplète");
+    else {
+      const met = evalCondition(read(), getStates());
+      setStatus(statusSpan, met ? "ok" : "ko", met ? "remplie" : "non remplie");
+    }
+  }
+
+  function onEntityChanged() { renderChips(); refresh(); }
+  entityInput.addEventListener("input", onEntityChanged);
+  entityInput.addEventListener("change", onEntityChanged);
+  compareSel.addEventListener("change", refresh);
+
+  card._laRead = read;
+  card._laError = error;
+  card._laRefresh = refresh;
+
+  renderChips();
+  refresh();
+  return card;
 }
 
 // ---------------------------------------------------------------------------
@@ -525,12 +826,11 @@ function makeActionCard(orderVal, actionData, servicesMap, entityList = [], enti
 
   const delBtn = document.createElement("button");
   delBtn.type = "button";
-  delBtn.className = "btn-icon btn-delete-action"; delBtn.textContent = "✕ Supprimer l'action";
-  delBtn.style.marginLeft = "8px";
+  delBtn.className = "btn-icon btn-delete-action"; delBtn.textContent = "🗑"; delBtn.title = "Supprimer l'action";
   // .remove() / reorder side-effects (renumbering, ↑/↓ disabled state) are
   // wired from makePhaseBlock, which owns the surrounding container.
 
-  hdr.append(orderBtns, headerLeft, delBtn);
+  hdr.append(headerLeft, orderBtns, delBtn);
 
   const body = document.createElement("div");
   body.className = "action-card-body";
@@ -778,8 +1078,8 @@ function renumberAndSort(container, selector, hasNumber = false) {
   });
 }
 
-// Wires the ↑ / ↓ / ✕ buttons of a single reorderable item (an action-card
-// or a cond-row) once it has been appended into its container. Swapping
+// Wires the ↑ / ↓ / 🗑 buttons of a single reorderable item (an action-card
+// or a cond-card) once it has been appended into its container. Swapping
 // dataset.order between visual neighbours is what actually changes the
 // real/save order — see readPhaseBlock, which always reads items sorted by
 // dataset.order ascending, never by raw DOM position.
@@ -794,6 +1094,7 @@ function wireReorderableItem(el, container, selector, { hasNumber = false, delet
     el.dataset.order = other.dataset.order;
     other.dataset.order = tmp;
     renumberAndSort(container, selector, hasNumber);
+    container.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
   if (upBtn) upBtn.onclick = () => {
@@ -813,10 +1114,11 @@ function wireReorderableItem(el, container, selector, { hasNumber = false, delet
   if (delBtn) delBtn.onclick = () => {
     el.remove();
     renumberAndSort(container, selector, hasNumber);
+    container.dispatchEvent(new Event("change", { bubbles: true }));
   };
 }
 
-function makePhaseBlock(phase, phaseData, servicesMap, entityList = [], entityAttrs = {}) {
+function makePhaseBlock(phase, phaseData, servicesMap, entityList = [], entityAttrs = {}, getStates = () => ({})) {
   const isStart = phase === "on_start";
   const block = document.createElement("div");
   block.className = "phase-block";
@@ -840,16 +1142,33 @@ function makePhaseBlock(phase, phaseData, servicesMap, entityList = [], entityAt
   const condTitleRow = document.createElement("div");
   condTitleRow.className = "cond-block-title";
 
-  const condCollapseBtn = document.createElement("button");
-  condCollapseBtn.type = "button";
-  condCollapseBtn.className = "btn-collapse";
-  condCollapseBtn.title = "Déplier / replier";
+  let existingConds = [];
+  if (phaseData && typeof phaseData === "object" && !Array.isArray(phaseData)) {
+    existingConds = Array.isArray(phaseData.conditions) ? phaseData.conditions : [];
+  }
+  // The top-level list is an implicit AND; a single `or` wrapper around
+  // everything is what the "OU" choice of the selector is stored as.
+  let operator = "and";
+  if (existingConds.length === 1 && isOrWrapper(existingConds[0])) {
+    operator = "or";
+    existingConds = existingConds[0].conditions;
+  }
 
   const condTitleLeft = document.createElement("div");
   condTitleLeft.className = "cond-block-title-left";
   const condTitleText = document.createElement("span");
-  condTitleText.textContent = "🔎 Conditions (toutes doivent être vraies)";
-  condTitleLeft.append(condCollapseBtn, condTitleText);
+  condTitleText.textContent = "🔎 Conditions reliées par";
+  const opSel = document.createElement("select");
+  opSel.className = "cond-op-sel";
+  opSel.title = "ET : toutes les conditions doivent être remplies. OU : une seule suffit.";
+  [{ v: "and", l: "ET" }, { v: "or", l: "OU" }].forEach(({ v, l }) => {
+    const o = document.createElement("option"); o.value = v; o.textContent = l;
+    opSel.appendChild(o);
+  });
+  opSel.value = operator;
+  const ruleStatus = document.createElement("span");
+  ruleStatus.className = "cond-status";
+  condTitleLeft.append(condTitleText, opSel, ruleStatus);
 
   const addCondBtn = document.createElement("button");
   addCondBtn.type = "button";
@@ -859,33 +1178,39 @@ function makePhaseBlock(phase, phaseData, servicesMap, entityList = [], entityAt
   const condList = document.createElement("div");
   condList.className = "cond-list";
 
-  function setCondCollapsed(collapsed) {
-    condBlock.classList.toggle("collapsed", collapsed);
-    condCollapseBtn.textContent = collapsed ? "▸" : "▾";
-  }
-  condTitleLeft.onclick = () => setCondCollapsed(!condBlock.classList.contains("collapsed"));
+  const condCards = () => Array.from(condList.querySelectorAll(".cond-card"));
 
-  let existingConds = [];
-  if (phaseData && typeof phaseData === "object" && !Array.isArray(phaseData)) {
-    existingConds = phaseData.conditions || [];
+  // Badge of the whole rule: would the service calls below run right now?
+  function refreshRuleStatus() {
+    const cards = condCards();
+    const items = cards.map(c => c._laRead()).filter(Boolean);
+    if (!items.length) setStatus(ruleStatus, "", "");
+    else if (cards.some(c => c._laError())) setStatus(ruleStatus, "warn", "Règle incomplète");
+    else {
+      const states = getStates();
+      const results = items.map(c => evalCondition(c, states));
+      const met = opSel.value === "or" ? results.some(Boolean) : results.every(Boolean);
+      setStatus(ruleStatus, met ? "ok" : "ko", met ? "Règle remplie" : "Règle non remplie");
+    }
   }
+  condBlock.addEventListener("input", refreshRuleStatus);
+  condBlock.addEventListener("change", refreshRuleStatus);
+
+  function addCondCard(cond, orderVal, startCollapsed) {
+    const card = makeCondCard(cond, entityList, orderVal, getStates, startCollapsed);
+    condList.appendChild(card);
+    wireReorderableItem(card, condList, ".cond-card", { deleteSelector: ".btn-delete-cond" });
+  }
+
   let nextCondOrder = existingConds.length;
-  existingConds.forEach((c, i) => {
-    const row = makeCondRow(c, entityList, i);
-    condList.appendChild(row);
-    wireReorderableItem(row, condList, ".cond-row", { deleteSelector: ".btn-delete-cond" });
-  });
-  renumberAndSort(condList, ".cond-row");
-  // Pre-existing conditions start collapsed (reduce clutter on an already
-  // configured event); a brand-new, empty conditions list starts expanded.
-  setCondCollapsed(existingConds.length > 0);
+  // Pre-existing conditions start collapsed (one-line summary + badge) to
+  // reduce clutter on an already configured event; new ones start expanded.
+  existingConds.forEach((c, i) => addCondCard(c, i, /* startCollapsed */ true));
+  renumberAndSort(condList, ".cond-card");
 
   addCondBtn.onclick = () => {
-    const row = makeCondRow({}, entityList, nextCondOrder++);
-    condList.appendChild(row);
-    wireReorderableItem(row, condList, ".cond-row", { deleteSelector: ".btn-delete-cond" });
-    renumberAndSort(condList, ".cond-row");
-    setCondCollapsed(false); // always reveal the list so the new row is visible
+    addCondCard({}, nextCondOrder++, /* startCollapsed */ false);
+    renumberAndSort(condList, ".cond-card");
   };
   condBlock.append(condTitleRow, condList);
 
@@ -928,6 +1253,21 @@ function makePhaseBlock(phase, phaseData, servicesMap, entityList = [], entityAt
 
   body.append(condBlock, actTitleRow, actionsContainer);
   block.append(hdr, body);
+
+  // Called by the panel on every hass update so badges follow live states.
+  block._laRefresh = () => {
+    condCards().forEach(c => c._laRefresh());
+    refreshRuleStatus();
+  };
+  // First half-filled condition, as a message for the save toast (or null).
+  block._laError = () => {
+    for (const c of condCards()) {
+      const err = c._laError();
+      if (err) return `${isStart ? "Au démarrage" : "À la fin"} : condition incomplète, ${err}.`;
+    }
+    return null;
+  };
+  refreshRuleStatus();
   return block;
 }
 
@@ -937,9 +1277,15 @@ function readPhaseBlock(block) {
   // This stays equal to creation order unless the user has explicitly used
   // the ↑/↓ buttons on a given list, at which point the swapped order
   // values are exactly what gets read here.
-  const condRows = Array.from(block.querySelectorAll(".cond-list .cond-row"))
+  const condCards = Array.from(block.querySelectorAll(".cond-list .cond-card"))
     .sort((a, b) => Number(a.dataset.order) - Number(b.dataset.order));
-  const conditions = condRows.map(r => readCondRow(r)).filter(c => c.entity_id);
+  const items = condCards.map(c => c._laRead()).filter(Boolean);
+  const operator = block.querySelector(".cond-op-sel").value;
+  // AND is the implicit top-level list; OR needs a wrapper (pointless around
+  // a single condition).
+  const conditions = operator === "or" && items.length > 1
+    ? [{ condition: "or", conditions: items }]
+    : items;
 
   const actionCards = Array.from(block.querySelectorAll(".action-card"))
     .sort((a, b) => Number(a.dataset.order) - Number(b.dataset.order));
@@ -974,6 +1320,8 @@ class LocalAgendaPanel extends HTMLElement {
     const first = !this._hass;
     this._hass = hass;
     if (first) this._init();
+    // Keep the "remplie / non remplie" badges in sync with live states.
+    else this._shadow.querySelectorAll(".phase-block").forEach(b => { if (b._laRefresh) b._laRefresh(); });
   }
 
   set panel(p) { this._panel = p; }
@@ -1116,6 +1464,10 @@ class LocalAgendaPanel extends HTMLElement {
 
   async _save() {
     const phases = this._shadow.querySelectorAll(".phase-block");
+    for (const block of phases) {
+      const err = block._laError ? block._laError() : null;
+      if (err) { this._showToast(err, "error"); return; }
+    }
     const actions = {};
     phases.forEach(block => {
       const data = readPhaseBlock(block);
@@ -1302,8 +1654,9 @@ class LocalAgendaPanel extends HTMLElement {
     info.style.cssText = "background:#e3f2fd;border-radius:6px;padding:12px 16px;font-size:13px;color:#1565c0;border:1px solid #90caf9;";
     info.innerHTML = "ℹ️  Tapez une partie du nom pour filtrer les services ou les entités. Les flèches ↑↓ et Entrée permettent de naviguer dans la liste.";
 
-    const startBlock = makePhaseBlock("on_start", this._currentActions.on_start || null, this._servicesMap, this._entityList, this._entityAttrs);
-    const stopBlock  = makePhaseBlock("on_stop",  this._currentActions.on_stop  || null, this._servicesMap, this._entityList, this._entityAttrs);
+    const getStates = () => (this._hass && this._hass.states) || {};
+    const startBlock = makePhaseBlock("on_start", this._currentActions.on_start || null, this._servicesMap, this._entityList, this._entityAttrs, getStates);
+    const stopBlock  = makePhaseBlock("on_stop",  this._currentActions.on_stop  || null, this._servicesMap, this._entityList, this._entityAttrs, getStates);
 
     body.append(info, startBlock, stopBlock);
     editor.append(hdr, body);

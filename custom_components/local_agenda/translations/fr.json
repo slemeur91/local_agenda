@@ -5,7 +5,7 @@
         "title": "Créer un calendrier Local Agenda",
         "description": "Créez un calendrier qui peut stocker les événements localement et déclencher des services au début/à la fin de l'événement.",
         "data": {
-          "name": "Nom du calendrier"
+          "calendar_name": "Nom du calendrier"
         }
       }
     }

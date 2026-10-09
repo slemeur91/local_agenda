@@ -5,7 +5,7 @@
         "title": "Create a Local Agenda calendar",
         "description": "Create a calendar that can store events locally and trigger services on event start/end.",
         "data": {
-          "name": "Calendar name"
+          "calendar_name": "Calendar name"
         }
       }
     }

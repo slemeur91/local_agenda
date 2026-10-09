@@ -6,6 +6,8 @@
 
 Un composant personnalisé pour Home Assistant qui étend l'intégration `local_calendar` en ajoutant la possibilité de déclencher des services Home Assistant au début et/ou à la fin d'événements.
 
+📖 **Documentation détaillée : [wiki du projet](https://github.com/slemeur91/local_agenda/wiki)**
+
 ---
 
 ## Origine et conception
