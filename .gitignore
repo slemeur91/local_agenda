@@ -7,6 +7,7 @@ venv
 .DS_Store
 tests
 .ruff_cache
+Wiki
 
 # Home Assistant configuration
 config/*
