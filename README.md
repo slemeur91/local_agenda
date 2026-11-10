@@ -24,14 +24,9 @@ L'intégration calendrier native de Home Assistant utilise des **événements HA
 1. **Événements croisés** : si l'événement A démarre, puis l'événement B démarre, puis A s'arrête, puis B s'arrête — les événements HA se mélangent et les déclenchements sont incorrects ou manqués.
 2. **Événements proches** : lorsque la fin d'un événement et le début du suivant sont très rapprochés dans le temps, les transitions sont ratées ou doublées.
 
-**Solution retenue** : Local Agenda n'utilise **pas** le bus d'événements HA. À la place, un **scheduleur interne interroge toutes les 20 secondes** (`async_track_time_interval`) la liste des événements dans une fenêtre glissante de ±22 secondes autour du moment présent. Chaque déclenchement est protégé par une **clé de déduplication unique** composée de l'`entry_id`, de l'`uid` de l'événement et de l'horodatage ISO de début ou de fin :
+**Solution retenue** : Local Agenda n'utilise **pas** le bus d'événements HA. Un **scheduleur interne** retient l'instant jusqu'auquel il a traité l'agenda et traite, à chaque passage, tous les débuts et fins tombés depuis : chaque transition est exécutée une fois et une seule, même avec des événements croisés ou très proches. Un minuteur le déclenche à l'heure exacte de chaque transition, et l'instant traité est enregistré, ce qui permet de rattraper après un redémarrage ce qui s'est passé pendant l'arrêt.
 
-```
-start_key = "{entry_id}:{uid}:{start_iso}:start"
-stop_key  = "{entry_id}:{uid}:{end_iso}:stop"
-```
-
-Cette clé garantit qu'une même action n'est jamais déclenchée deux fois, même avec des événements croisés ou très proches. Les événements récurrents sont également correctement gérés : l'horodatage de l'occurrence est inclus dans la clé, de sorte que chaque occurrence d'un même événement récurrent obtient son propre ticket.
+Les actions sont exécutées par le **moteur de scripts de Home Assistant** : syntaxe des automatisations (`delay`, `if`, modèles Jinja…) et variables `agenda`, `phase` et `event`. Les blocs écrits pour les versions précédentes fonctionnent sans changement.
 
 ---
 
@@ -136,11 +131,9 @@ Voir [Panneau Local Agenda](https://github.com/slemeur91/local_agenda/wiki/Panne
 
 ## Limitations
 
-- Les actions partent avec une précision d'une vingtaine de secondes.
-- Si Home Assistant est arrêté lors d'un début ou d'une fin d'événement, l'action n'est pas rattrapée.
-- La déduplication est en mémoire : une action peut être rejouée si Home Assistant redémarre juste après une transition.
+- Après un arrêt de Home Assistant, seuls les événements encore en cours (début) et ceux commencés avant l'arrêt (fin) sont rattrapés, sur 7 jours au plus.
 - Les événements doivent avoir des heures précises, pas « toute la journée ».
-- Seules les conditions `state`, `or`, `and` et `not` sont prises en charge.
+- Seules les conditions `state`, `numeric_state`, `or`, `and` et `not` sont prises en charge dans les conditions de l'événement.
 
 La liste complète est dans [Limitations](https://github.com/slemeur91/local_agenda/wiki/Limitations).
 

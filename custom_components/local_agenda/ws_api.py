@@ -9,7 +9,7 @@ from homeassistant.components import websocket_api
 from homeassistant.core import HomeAssistant, callback
 
 from .const import DOMAIN
-from .actions import parse_actions, set_actions_block
+from .actions import async_validate_steps, parse_actions, set_actions_block
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -203,6 +203,16 @@ async def ws_set_actions(
     store = hass.data.get(DOMAIN, {}).get(entry_id, {}).get("store")
     if store is None:
         connection.send_error(msg["id"], "not_found", "Calendar entry not found")
+        return
+
+    # Refuse invalid actions now rather than discover them when the event
+    # starts, possibly weeks later.
+    errors = []
+    for phase, value in new_actions.items():
+        steps = value.get("actions") if isinstance(value, dict) else value
+        errors += [f"{phase}, {err}" for err in await async_validate_steps(hass, steps or [])]
+    if errors:
+        connection.send_error(msg["id"], "invalid_format", " ; ".join(errors))
         return
 
     cal = store.get_calendar()

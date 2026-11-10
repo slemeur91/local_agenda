@@ -43,17 +43,43 @@ With conditions — dict with optional `conditions` + `actions` keys:
     ---/actions---
 
 Both `on_start` and `on_stop` accept either format independently.
-Supported condition types: state, or, and, not.
+Supported condition types: state, numeric_state, or, and, not.
 A condition of any other type is treated as not met.
+
+Execution
+---------
+
+The actions run through Home Assistant's script engine, so they accept the
+syntax of automations (`action:` or `service:`, `delay`, `if`, `choose`,
+`wait_template`, templates…) and see three variables: `agenda` (calendar
+name), `phase` ("start" / "stop") and `event` (`uid`, `summary`,
+`description`, `location`, `start`, `end`, `all_day`).
+
+- A list made only of service calls — the only form up to 1.2.x — keeps its
+  historical behaviour: each call runs on its own, launched in order without
+  waiting for the previous one, and a failing call does not stop the others.
+- Any other list runs as one script: each step waits for the previous one
+  and an error stops the rest, exactly as in an automation.
 """
 from __future__ import annotations
 
+import json
 import logging
 import re
 from typing import Any
 
+import voluptuous as vol
 import yaml
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Context, HomeAssistant
+from homeassistant.exceptions import HomeAssistantError
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.script import (
+    SCRIPT_MODE_PARALLEL,
+    Script,
+    async_validate_actions_config,
+)
+
+from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -165,6 +191,9 @@ async def _check_single_condition(hass: HomeAssistant, cond: Any) -> bool:
             return actual in [_expected_state(e) for e in expected]
         return actual == _expected_state(expected)
 
+    if kind == "numeric_state":
+        return _check_numeric_state(hass, cond)
+
     if kind == "or":
         for sub in cond.get("conditions") or []:
             if await _check_single_condition(hass, sub):
@@ -191,6 +220,55 @@ async def _check_single_condition(hass: HomeAssistant, cond: Any) -> bool:
     return False
 
 
+def _as_number(value: Any) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _check_numeric_state(hass: HomeAssistant, cond: dict) -> bool:
+    """`numeric_state`: the state (or an attribute) is above and/or below a bound.
+
+    Same meaning as in Home Assistant: both bounds are strict, and a state
+    that is not a number (unavailable, unknown…) never satisfies it.
+    """
+    entity_id = cond.get("entity_id")
+    above = cond.get("above")
+    below = cond.get("below")
+    if above is None and below is None:
+        _LOGGER.warning(
+            "local_agenda: numeric_state on '%s' without above or below — "
+            "treated as not met", entity_id,
+        )
+        return False
+    above_n = _as_number(above) if above is not None else None
+    below_n = _as_number(below) if below is not None else None
+    if (above is not None and above_n is None) or (below is not None and below_n is None):
+        _LOGGER.warning(
+            "local_agenda: numeric_state on '%s': above/below must be numbers — "
+            "treated as not met", entity_id,
+        )
+        return False
+
+    state_obj = hass.states.get(entity_id)
+    if state_obj is None:
+        _LOGGER.debug("local_agenda: entity '%s' not found", entity_id)
+        return False
+    attribute = cond.get("attribute")
+    raw = state_obj.attributes.get(attribute) if attribute else state_obj.state
+    value = _as_number(raw)
+    if value is None:
+        return False
+    if above_n is not None and not value > above_n:
+        return False
+    if below_n is not None and not value < below_n:
+        return False
+    return True
+
+
 async def _conditions_pass(
     hass: HomeAssistant,
     conditions: list[dict],
@@ -209,48 +287,89 @@ async def _conditions_pass(
 
 
 # ---------------------------------------------------------------------------
-# Service execution
+# Execution
 # ---------------------------------------------------------------------------
 
-async def _call_services(
-    hass: HomeAssistant,
-    service_list: list[dict[str, Any]],
-    summary: str,
-    phase: str,
-) -> None:
-    """Fire a plain list of service-call dicts."""
-    for action in service_list:
-        if not isinstance(action, dict):
-            continue
-        service_str = action.get("service", "")
-        if not isinstance(service_str, str) or "." not in service_str:
-            _LOGGER.warning(
-                "local_agenda: invalid service '%s' in actions block", service_str
-            )
-            continue
-        domain, service_name = service_str.split(".", 1)
-        target = action.get("target") or {}
-        data = action.get("data") or {}
-        # Shorthand: entity_id at root level
-        if "entity_id" in action and "entity_id" not in target:
-            target = {**target, "entity_id": action["entity_id"]}
+# Keys a service call step could have up to 1.2.x (plus `action:`, the
+# current name of `service:` in Home Assistant).
+_SERVICE_CALL_KEYS = {"service", "action", "target", "data", "entity_id"}
+
+# Validated Script objects, by their action list.  Home Assistant keeps every
+# top-level Script it is given in a registry until shutdown, so one is built
+# per distinct action list instead of one per run.
+_SCRIPTS_KEY = f"{DOMAIN}_scripts"
+
+
+def _is_service_call(step: Any) -> bool:
+    return (
+        isinstance(step, dict)
+        and ("service" in step or "action" in step)
+        and set(step) <= _SERVICE_CALL_KEYS
+    )
+
+
+def is_service_call_list(steps: list) -> bool:
+    """True for a list made only of service calls (the historical format)."""
+    return all(_is_service_call(step) for step in steps)
+
+
+async def async_validate_steps(hass: HomeAssistant, steps: Any) -> list[str]:
+    """Return a readable error for each invalid step (empty list when valid)."""
+    if not isinstance(steps, list):
+        steps = [steps]
+    errors = []
+    for index, step in enumerate(steps, start=1):
         try:
-            _LOGGER.info(
-                "local_agenda: [%s] '%s' → %s.%s",
-                phase, summary, domain, service_name,
-            )
-            await hass.services.async_call(
-                domain,
-                service_name,
-                service_data=data,
-                target=target,
-                blocking=False,
-            )
-        except Exception as exc:
-            _LOGGER.error(
-                "local_agenda: error calling %s.%s for '%s': %s",
-                domain, service_name, summary, exc,
-            )
+            await async_validate_actions_config(hass, cv.SCRIPT_SCHEMA([step]))
+        except (vol.Invalid, HomeAssistantError) as err:
+            errors.append(f"action {index}: {err}")
+    return errors
+
+
+async def _async_script(
+    hass: HomeAssistant, steps: list, name: str
+) -> Script:
+    """Return the Script for `steps`, validated and built once."""
+    scripts: dict[str, Script] = hass.data.setdefault(_SCRIPTS_KEY, {})
+    key = json.dumps([name, steps], sort_keys=True, default=str)
+    if (script := scripts.get(key)) is None:
+        validated = await async_validate_actions_config(
+            hass, cv.SCRIPT_SCHEMA(steps)
+        )
+        script = Script(
+            hass,
+            validated,
+            name,
+            DOMAIN,
+            script_mode=SCRIPT_MODE_PARALLEL,
+            max_runs=50,
+            logger=_LOGGER,
+        )
+        scripts[key] = script
+    return script
+
+
+async def _async_run(
+    hass: HomeAssistant,
+    steps: list,
+    name: str,
+    variables: dict[str, Any],
+) -> None:
+    """Validate and run one script; errors are logged, never raised."""
+    try:
+        script = await _async_script(hass, steps, name)
+    except (vol.Invalid, HomeAssistantError) as err:
+        _LOGGER.error("local_agenda: invalid actions for %s: %s", name, err)
+        return
+    try:
+        await script.async_run(run_variables=variables, context=Context())
+    except Exception:  # the script engine has logged the failing step
+        _LOGGER.debug("local_agenda: actions for %s stopped on an error", name)
+
+
+def _start(hass: HomeAssistant, coro: Any, name: str) -> None:
+    """Run a script in the background: a `delay` must not hold the scheduler."""
+    hass.async_create_background_task(coro, f"{DOMAIN} {name}")
 
 
 async def fire_actions(
@@ -258,34 +377,60 @@ async def fire_actions(
     phase_config: list | dict,
     event_summary: str,
     phase: str,
+    variables: dict[str, Any] | None = None,
 ) -> None:
     """Execute the on_start or on_stop config for one event phase.
 
     Accepts either:
-    - a list  → plain service calls (no conditions)
+    - a list  → the actions (no conditions)
     - a dict  → {conditions: [...], actions: [...]}
+
+    Conditions are evaluated here; the actions are then started in the
+    background and this returns without waiting for them.
     """
     if isinstance(phase_config, list):
-        # Simple backward-compatible format
-        await _call_services(hass, phase_config, event_summary, phase)
-
+        steps: Any = phase_config
     elif isinstance(phase_config, dict):
         conditions = phase_config.get("conditions") or []
-        service_list = phase_config.get("actions") or []
+        steps = phase_config.get("actions") or []
         if not isinstance(conditions, list):
             conditions = [conditions]
-        if not isinstance(service_list, list):
-            service_list = [service_list]
-
-        if conditions:
-            ok = await _conditions_pass(hass, conditions, event_summary, phase)
-            if not ok:
-                return
-
-        await _call_services(hass, service_list, event_summary, phase)
-
+        if conditions and not await _conditions_pass(
+            hass, conditions, event_summary, phase
+        ):
+            return
     else:
         _LOGGER.warning(
             "local_agenda: unexpected actions format for '%s' [%s]: %s",
             event_summary, phase, type(phase_config),
         )
+        return
+    if not isinstance(steps, list):
+        steps = [steps]
+    # As before 1.3.0, an entry that is not a mapping is skipped on its own
+    # instead of invalidating the whole list.
+    for step in steps:
+        if not isinstance(step, dict):
+            _LOGGER.warning(
+                "local_agenda: ignoring malformed action %r for '%s'", step, event_summary
+            )
+    steps = [step for step in steps if isinstance(step, dict)]
+    if not steps:
+        return
+
+    variables = {
+        "agenda": "",
+        "phase": "stop" if phase == "stop" else "start",
+        "event": {"summary": event_summary},
+        **(variables or {}),
+    }
+    name = f"{variables['agenda'] or DOMAIN} – {event_summary} [{variables['phase']}]"
+    _LOGGER.info("local_agenda: [%s] '%s' — %d action(s)", phase, event_summary, len(steps))
+
+    if is_service_call_list(steps):
+        # Historical behaviour: every call on its own, launched in order,
+        # none waiting for or stopped by another.
+        for index, step in enumerate(steps, start=1):
+            _start(hass, _async_run(hass, [step], f"{name} #{index}", variables), name)
+    else:
+        _start(hass, _async_run(hass, steps, name, variables), name)

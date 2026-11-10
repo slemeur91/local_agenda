@@ -24,14 +24,9 @@ Home Assistant's native calendar integration relies on **HA events** (the event 
 1. **Overlapping events**: if event A starts, then event B starts, then A ends, then B ends, the HA events get mixed up and triggers are wrong or missed.
 2. **Back-to-back events**: when the end of one event and the start of the next are very close in time, transitions are missed or fired twice.
 
-**The chosen solution**: Local Agenda does **not** use the HA event bus. Instead, an **internal scheduler polls every 20 seconds** (`async_track_time_interval`) the events found in a sliding window of ±22 seconds around the current time. Each trigger is protected by a **unique deduplication key** made of the `entry_id`, the event `uid` and the ISO timestamp of its start or end:
+**The chosen solution**: Local Agenda does **not** use the HA event bus. An **internal scheduler** remembers the moment up to which it has processed the calendar and, on each pass, handles every start and end since then: each transition runs exactly once, even with overlapping or back-to-back events. A timer triggers it at the exact time of each transition, and the processed moment is saved, so what happened while Home Assistant was stopped is caught up after a restart.
 
-```
-start_key = "{entry_id}:{uid}:{start_iso}:start"
-stop_key  = "{entry_id}:{uid}:{end_iso}:stop"
-```
-
-This key guarantees that an action is never fired twice, even with overlapping or back-to-back events. Recurring events are handled correctly too: the timestamp of the occurrence is part of the key, so each occurrence of a recurring event gets its own ticket.
+Actions run through **Home Assistant's script engine**: automation syntax (`delay`, `if`, Jinja templates…) and the `agenda`, `phase` and `event` variables. Blocks written for earlier versions work unchanged.
 
 ---
 
@@ -152,12 +147,9 @@ The panel interface is currently available in French only.
 
 ## Limitations
 
-- Actions fire with a precision of about twenty seconds.
-- If Home Assistant is down when an event starts or ends, the action is not replayed afterwards.
-- Deduplication is in memory: an action may fire again if Home Assistant restarts right after a transition.
+- After Home Assistant was stopped, only events still in progress (start) and events that had started before the stop (end) are caught up, over 7 days at most.
 - Events must have specific times, not "all day".
-- Only `state`, `or`, `and` and `not` conditions are supported.
-- Jinja templates are not rendered in action data.
+- Only `state`, `numeric_state`, `or`, `and` and `not` are supported as event conditions.
 
 ---
 

@@ -2,7 +2,7 @@
 // Vanilla JS custom element, no build step required.
 // Registered automatically by the integration via async_register_built_in_panel.
 
-const VERSION = "1.9.1";
+const VERSION = "1.10.0";
 console.info(`%c[local_agenda] panel.js v${VERSION} loaded`, "color:#03a9f4;font-weight:bold;");
 
 // ---------------------------------------------------------------------------
@@ -536,6 +536,16 @@ function evalCondition(cond, states) {
       if (Array.isArray(cond.state)) return cond.state.map(expectedState).includes(st.state);
       return st.state === expectedState(cond.state);
     }
+    case "numeric_state": {
+      const st = states[cond.entity_id];
+      if (!st) return false;
+      const num = (v) => (typeof v === "boolean" || v === null || v === undefined || v === "" ? NaN : Number(v));
+      const value = num(cond.attribute ? (st.attributes || {})[cond.attribute] : st.state);
+      const above = cond.above === undefined || cond.above === null ? null : num(cond.above);
+      const below = cond.below === undefined || cond.below === null ? null : num(cond.below);
+      if ((above === null && below === null) || Number.isNaN(value) || Number.isNaN(above) || Number.isNaN(below)) return false;
+      return (above === null || value > above) && (below === null || value < below);
+    }
     case "or": return subs.some(s => evalCondition(s, states));
     case "and": return subs.every(s => evalCondition(s, states));
     case "not": return !subs.some(s => evalCondition(s, states));
@@ -783,7 +793,90 @@ function makeCondCard(cond, entityList = [], orderVal = 0, getStates = () => ({}
 // ---------------------------------------------------------------------------
 // Action card
 // ---------------------------------------------------------------------------
+// The action form edits one service call: `service:` (or `action:`, its
+// current name in Home Assistant) with an optional target entity and flat
+// data whose values are text or numbers.  Any other step — delay, if,
+// choose, nested data, templates in the target… — is kept verbatim in a
+// read-only card, so saving from the panel never alters a hand-written action.
+function isFormAction(a) {
+  if (!isPlainObject(a)) return false;
+  const verb = a.service !== undefined ? "service" : (a.action !== undefined ? "action" : null);
+  if (!verb || (a.service !== undefined && a.action !== undefined)) return false;
+  if (typeof a[verb] !== "string") return false;
+  if (!hasOnlyKeys(a, [verb, "target", "data", "entity_id"])) return false;
+  const isIds = (v) => typeof v === "string" || (Array.isArray(v) && v.every(x => typeof x === "string"));
+  if (a.target !== undefined) {
+    if (!isPlainObject(a.target) || !hasOnlyKeys(a.target, ["entity_id"]) || !isIds(a.target.entity_id)) return false;
+  }
+  if (a.entity_id !== undefined && (!isIds(a.entity_id) || a.target !== undefined)) return false;
+  if (a.data !== undefined) {
+    if (!isPlainObject(a.data)) return false;
+    if (!Object.values(a.data).every(v => typeof v === "string" || typeof v === "number")) return false;
+  }
+  return true;
+}
+
+function makeRawActionCard(orderVal, actionData, startCollapsed = false) {
+  const card = document.createElement("div");
+  card.className = "action-card";
+  card.dataset.order = String(orderVal);
+
+  const hdr = document.createElement("div");
+  hdr.className = "action-card-header";
+  const collapseBtn = document.createElement("button");
+  collapseBtn.type = "button"; collapseBtn.className = "btn-collapse"; collapseBtn.title = "Déplier / replier";
+  const numSpan = document.createElement("span");
+  numSpan.className = "action-number"; numSpan.textContent = "#?";
+  const summarySpan = document.createElement("span");
+  summarySpan.className = "action-card-summary";
+  const kind = isPlainObject(actionData)
+    ? (actionData.action || actionData.service || Object.keys(actionData)[0] || "?")
+    : "?";
+  summarySpan.textContent = `Action avancée : ${kind} (non modifiable ici)`;
+  const headerLeft = document.createElement("div");
+  headerLeft.className = "action-card-header-left";
+  headerLeft.append(collapseBtn, numSpan, summarySpan);
+
+  const orderBtns = document.createElement("div");
+  orderBtns.className = "order-btns";
+  const upBtn = document.createElement("button");
+  upBtn.type = "button"; upBtn.className = "btn-order btn-order-up"; upBtn.textContent = "↑"; upBtn.title = "Monter";
+  const downBtn = document.createElement("button");
+  downBtn.type = "button"; downBtn.className = "btn-order btn-order-down"; downBtn.textContent = "↓"; downBtn.title = "Descendre";
+  orderBtns.append(upBtn, downBtn);
+  const delBtn = document.createElement("button");
+  delBtn.type = "button";
+  delBtn.className = "btn-icon btn-delete-action"; delBtn.textContent = "🗑"; delBtn.title = "Supprimer l'action";
+  hdr.append(headerLeft, orderBtns, delBtn);
+
+  const body = document.createElement("div");
+  body.className = "action-card-body";
+  const pre = document.createElement("pre");
+  pre.className = "cond-raw";
+  try { pre.textContent = toYaml(actionData); } catch (e) { pre.textContent = JSON.stringify(actionData, null, 2); }
+  const hint = document.createElement("div");
+  hint.className = "data-hint";
+  hint.textContent = "Écrite à la main dans la description de l'événement : elle est conservée telle quelle à la sauvegarde.";
+  body.append(pre, hint);
+
+  function setCollapsed(collapsed) {
+    card.classList.toggle("collapsed", collapsed);
+    collapseBtn.textContent = collapsed ? "▸" : "▾";
+  }
+  headerLeft.onclick = () => setCollapsed(!card.classList.contains("collapsed"));
+  setCollapsed(startCollapsed);
+
+  card._laRead = () => actionData;
+  card.append(hdr, body);
+  return card;
+}
+
 function makeActionCard(orderVal, actionData, servicesMap, entityList = [], entityAttrs = {}, startCollapsed = false) {
+  if (actionData && Object.keys(actionData).length && !isFormAction(actionData)) {
+    return makeRawActionCard(orderVal, actionData, startCollapsed);
+  }
+  // Keep the key the action was written with (`service:` or `action:`).
+  const verbKey = actionData && actionData.action !== undefined ? "action" : "service";
   // Flat sorted list of "domain.service" strings derived from servicesMap
   const svcList = [];
   for (const [domain, svcs] of Object.entries(servicesMap || {})) {
@@ -841,7 +934,7 @@ function makeActionCard(orderVal, actionData, servicesMap, entityList = [], enti
   svcLabel.innerHTML = "Service HA &nbsp;<span style='font-weight:400;color:var(--secondary-text-color);'>(domaine = type d'entité)</span>";
   const { wrapper: svcWrapper, input: svcInput } = makeFilterableInput({
     placeholder: "type_entité.action  (ex: switch.turn_on, light.turn_on)",
-    value: actionData.service || "",
+    value: actionData[verbKey] || "",
     options: svcList,
     className: "svc-input",
   });
@@ -953,7 +1046,7 @@ function makeActionCard(orderVal, actionData, servicesMap, entityList = [], enti
   // changes to a different one — not on every keystroke while it's still
   // being typed/incomplete, and not on initial load (where the saved data
   // is assumed correct as-is).
-  let lastAutoFilledService = actionData.service || "";
+  let lastAutoFilledService = actionData[verbKey] || "";
 
   function autoFillFields() {
     const svcFull = svcInput.value.trim();
@@ -1012,7 +1105,7 @@ function makeActionCard(orderVal, actionData, servicesMap, entityList = [], enti
   }
   svcInput.addEventListener("input", onServiceChanged);
   svcInput.addEventListener("change", onServiceChanged);
-  if (actionData.service && servicesMap) autoFillFields();
+  if (actionData[verbKey] && servicesMap) autoFillFields();
 
   // ---- Collapse / expand ----
   function updateSummary() {
@@ -1028,17 +1121,19 @@ function makeActionCard(orderVal, actionData, servicesMap, entityList = [], enti
   headerLeft.onclick = () => setCollapsed(!card.classList.contains("collapsed"));
   setCollapsed(startCollapsed);
 
+  card.dataset.verb = verbKey;
   card.append(hdr, body);
   return card;
 }
 
 function readActionCard(card) {
+  if (card._laRead) return card._laRead();
   const svc = card.querySelector(".svc-input").value.trim();
   const targetStr = card.querySelector(".target-input").value.trim();
   const data = readDataRows(card.querySelector(".data-container"));
 
   const action = {};
-  if (svc) action.service = svc;
+  if (svc) action[card.dataset.verb || "service"] = svc;
   if (targetStr) {
     const ids = targetStr.split(",").map(s => s.trim()).filter(Boolean);
     action.target = { entity_id: ids.length === 1 ? ids[0] : ids };
@@ -1290,7 +1385,11 @@ function readPhaseBlock(block) {
 
   const actionCards = Array.from(block.querySelectorAll(".action-card"))
     .sort((a, b) => Number(a.dataset.order) - Number(b.dataset.order));
-  const actions = actionCards.map(c => readActionCard(c)).filter(a => a.service);
+  // A form card with no service chosen is dropped; a read-only card is kept as is.
+  const actions = actionCards
+    .map(c => ({ kept: Boolean(c._laRead), a: readActionCard(c) }))
+    .filter(({ kept, a }) => kept || a.service || a.action)
+    .map(({ a }) => a);
 
   if (actions.length === 0 && conditions.length === 0) return null;
   if (conditions.length === 0) return actions;

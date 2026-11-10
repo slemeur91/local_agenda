@@ -3,6 +3,62 @@
 Les versions antérieures à la 1.2.0 sont décrites dans les
 [releases GitHub](https://github.com/slemeur91/local_agenda/releases).
 
+## 1.3.0 – 2026-11-10
+
+Le moteur reprend trois idées de l'intégration
+[agenda-ha](https://github.com/jolabs40/agenda-ha) : un déclenchement sans
+transition perdue, l'exécution des actions par le moteur de scripts de Home
+Assistant et les conditions sur un seuil numérique.
+
+### Ajouts
+
+- **Actions exécutées comme des scripts Home Assistant** : la syntaxe des
+  automatisations est acceptée (`action:` ou `service:`, `delay`,
+  `wait_template`, `if`, `choose`, modèles Jinja…), avec trois variables :
+  `agenda`, `phase` (`start` / `stop`) et `event` (`summary`, `start`, `end`,
+  `uid`, `description`, `location`, `all_day`).
+- **Condition `numeric_state`** : au-dessus et/ou en dessous d'un seuil, sur
+  l'état ou sur un attribut (`attribute`).
+- **Rattrapage après un redémarrage** : le début d'un événement encore en
+  cours et la fin d'un événement commencé avant l'arrêt sont exécutés au
+  redémarrage (sur 7 jours au plus).
+- **Événement supprimé, déplacé ou raccourci pendant qu'il est en cours** :
+  son `on_stop` est exécuté aussitôt.
+- Le panneau vérifie les actions à l'enregistrement et refuse un bloc
+  invalide.
+
+### Changements
+
+- **Déclenchement à l'heure exacte** : un minuteur est posé sur chaque
+  transition (auparavant jusqu'à 20 secondes de retard). La fenêtre de
+  22 secondes et la mémoire des déclenchements disparaissent : chaque début
+  et chaque fin est traité une fois et une seule, redémarrage compris.
+- À la même heure, les fins sont exécutées avant les débuts.
+- Les actions s'exécutent en arrière-plan : un `delay` ne retarde pas les
+  autres événements.
+
+### Compatibilité
+
+- Les blocs écrits pour les versions précédentes fonctionnent sans
+  changement : une liste composée uniquement d'appels de service garde son
+  comportement (chaque appel part de son côté, sans attendre le précédent,
+  et un appel en échec n'empêche pas les suivants).
+- Seule différence possible : une valeur contenant `{{ ... }}` est désormais
+  évaluée comme un modèle.
+- **Panneau (panel.js 1.10.0)** : les actions qui ne sont pas un simple appel
+  de service (`delay`, `if`, données imbriquées, valeurs booléennes…) sont
+  affichées en lecture seule et conservées telles quelles à la sauvegarde ;
+  `action:` est reconnu comme `service:`. Les conditions `numeric_state` ont
+  leur badge « remplie / non remplie ».
+
+### Technique
+
+- Nouveau module `scheduler.py` ; l'état du scheduleur est enregistré dans
+  `config/.storage/local_agenda.scheduler.<entry_id>` et supprimé avec
+  l'agenda.
+- Nouvelle suite de tests `tests_ha/`, exécutée dans un vrai Home Assistant
+  (moteur de scripts, minuteurs, stockage).
+
 ## 1.2.2 – 2026-10-09
 
 Version de corrections issue d'un audit du code.

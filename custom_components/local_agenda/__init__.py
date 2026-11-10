@@ -2,18 +2,16 @@
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timedelta
 from pathlib import Path
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.exceptions import ConfigEntryError
 from homeassistant.helpers import config_validation as cv
-from homeassistant.helpers.event import async_track_time_interval
 
 from .const import DOMAIN, CONF_CALENDAR_NAME, calendar_file_key, legacy_file_key
 from .store import LocalAgendaStore
-from .actions import parse_actions, fire_actions
+from .scheduler import AgendaScheduler
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -109,13 +107,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
 
-    # Scheduler: check every 20 s for events starting/ending
-    async def _tick(now: datetime) -> None:
-        await _check_actions(hass, entry)
-
-    entry.async_on_unload(
-        async_track_time_interval(hass, _tick, timedelta(seconds=20))
-    )
+    # Scheduler: runs on_start / on_stop at each start and end (scheduler.py)
+    scheduler = AgendaScheduler(hass, entry)
+    hass.data[DOMAIN][entry.entry_id]["scheduler"] = scheduler
+    await scheduler.async_start()
 
     return True
 
@@ -123,9 +118,21 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     """Unload a config entry."""
     if unload_ok := await hass.config_entries.async_unload_platforms(entry, PLATFORMS):
-        hass.data[DOMAIN].pop(entry.entry_id, None)
-        hass.data[DOMAIN].pop(entry.entry_id + "_fired", None)
+        data = hass.data[DOMAIN].pop(entry.entry_id, None) or {}
+        if (scheduler := data.get("scheduler")) is not None:
+            await scheduler.async_stop()
     return unload_ok
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Forget the scheduler state of a removed calendar.
+
+    The .ics file itself is kept on purpose: recreating a calendar with the
+    same name brings its events back.
+    """
+    from homeassistant.helpers.storage import Store
+
+    await Store(hass, 1, f"{DOMAIN}.scheduler.{entry.entry_id}").async_remove()
 
 
 def _move_legacy_file(legacy_path: Path, store_path: Path) -> None:
@@ -146,109 +153,3 @@ def _move_legacy_file(legacy_path: Path, store_path: Path) -> None:
             "local_agenda: could not move calendar file %s to %s: %s",
             legacy_path, store_path, err,
         )
-
-
-async def _check_actions(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Fire on_start / on_stop actions for events crossing the current time."""
-    from homeassistant.util import dt as dt_util
-
-    now = dt_util.utcnow()
-    window = timedelta(seconds=22)
-
-    # Per-entry deduplication map: key -> UTC datetime at which it fired
-    # (lives for the duration of the HA session).
-    # Purge keys fired more than 10 minutes ago each tick to prevent unbounded
-    # growth on long-running HA instances with many recurring events.  10
-    # minutes is safely above the 22-second firing window, so no valid key is
-    # evicted.  The purge relies on the stored datetime, never on the key
-    # text: the key embeds an ISO timestamp (and possibly a UID) containing
-    # ":" and expressed in the event's own timezone, so it cannot be parsed
-    # or compared reliably.
-    fired: dict[str, datetime] = hass.data[DOMAIN].setdefault(
-        entry.entry_id + "_fired", {}
-    )
-    cutoff = now - timedelta(minutes=10)
-    for key in [k for k, fired_at in fired.items() if fired_at < cutoff]:
-        del fired[key]
-    entities = hass.data[DOMAIN].get(entry.entry_id, {}).get("entities", [])
-
-    for entity in entities:
-        # Skip entities that are disabled in the HA entity registry.
-        # Without this check the scheduler would fire actions from calendars
-        # that the user has explicitly turned off (disabled entity).
-        if not entity.enabled:
-            _LOGGER.debug(
-                "local_agenda: skipping action check for disabled entity '%s'",
-                getattr(entity, "entity_id", "?"),
-            )
-            continue
-
-        try:
-            events = await entity.async_get_events(hass, now - window, now + window)
-        except Exception as err:
-            _LOGGER.debug("Action check failed for entity: %s", err)
-            continue
-
-        for evt in events:
-            # One malformed event (bad actions block, unexpected date type…)
-            # must not prevent the other events of this tick from firing.
-            try:
-                await _check_event(hass, entry, evt, now, window, fired)
-            except Exception:
-                _LOGGER.exception(
-                    "local_agenda: action check failed for event '%s'",
-                    getattr(evt, "summary", "?"),
-                )
-
-
-def _comparable(value):  # type: ignore[no-untyped-def]
-    """Return a tz-aware datetime for a CalendarEvent start/end value.
-
-    All-day values (dates) start at local midnight; a floating datetime (no
-    timezone, possible in an imported .ics) is read as local time.  Without
-    this, comparing it with the UTC "now" raises TypeError.
-    """
-    import datetime as _dt
-    from homeassistant.util import dt as dt_util
-
-    if not isinstance(value, _dt.datetime):
-        return dt_util.start_of_local_day(value)
-    if value.tzinfo is None:
-        return value.replace(tzinfo=dt_util.DEFAULT_TIME_ZONE)
-    return value
-
-
-async def _check_event(hass, entry, evt, now, window, fired) -> None:  # type: ignore[no-untyped-def]
-    """Fire the actions of one event if it starts or ends in the window."""
-    uid = getattr(evt, "uid", None) or evt.summary or "?"
-    description = getattr(evt, "description", "") or ""
-    actions = parse_actions(description)
-    if not actions:
-        return
-
-    start = _comparable(evt.start)
-    end = _comparable(evt.end)
-
-    # Include the occurrence timestamp in the key so that different
-    # occurrences of the same recurring event (same UID) each get a
-    # unique deduplication entry.  Without the timestamp, the first
-    # occurrence would "burn" the key for all subsequent occurrences,
-    # silently preventing them from ever firing again in the same
-    # HA session.
-    start_key = f"{entry.entry_id}:{uid}:{start.isoformat()}:start"
-    if (
-        now - window <= start <= now
-        and start_key not in fired
-        and actions.get("on_start")
-    ):
-        await fire_actions(hass, actions["on_start"], evt.summary, "start")
-        fired[start_key] = now
-
-    stop_key = f"{entry.entry_id}:{uid}:{end.isoformat()}:stop"
-    if (
-        now - window <= end <= now
-        and stop_key not in fired
-        and actions.get("on_stop")
-    ):
-        await fire_actions(hass, actions["on_stop"], evt.summary, "stop")
-        fired[stop_key] = now
