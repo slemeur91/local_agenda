@@ -135,13 +135,15 @@ Quote values that YAML would read as something other than text: write `state: "o
 
 ## Local Agenda panel
 
-A **Local Agenda** entry is added to the Home Assistant sidebar. This panel lets you edit the conditions and service calls of an event through a form, without writing YAML by hand. Live badges show whether each condition is currently met.
+A **Local Agenda** entry is added to the Home Assistant sidebar. Since version 1.4.0 this panel does everything without writing YAML:
 
-<img src="images/panneau-condition.jpg" alt="Local Agenda panel with an expanded condition" width="800">
+- five views: **Week** (drag and drop events), **Month**, **House** (every calendar over one day), **List** and **Executions** (what will run and what ran);
+- a full event editor: times, repetition, color and icon, start and end conditions and actions;
+- other Home Assistant calendars shown for information, and suspending a calendar in one click.
+
+YAML blocks written by hand are still supported and kept as they are.
 
 The panel interface is currently available in French only.
-
-> ⚠️ This panel is recent and has not been fully battle-tested yet. Typing the YAML block in the event description remains the reference method.
 
 ---
 

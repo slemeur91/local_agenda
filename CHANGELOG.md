@@ -3,6 +3,50 @@
 Les versions antérieures à la 1.2.0 sont décrites dans les
 [releases GitHub](https://github.com/slemeur91/local_agenda/releases).
 
+## 1.4.0 – 2026-11-10
+
+Nouvelle interface du panneau (panel.js 2.0.0), inspirée de celle
+d'[agenda-ha](https://github.com/jolabs40/agenda-ha), sur le moteur de
+Local Agenda.
+
+### Panneau
+
+- **Cinq vues** : Semaine (une journée sur téléphone), Mois, Maison (tous les
+  agendas sur une journée, la ligne d'un agenda se dédoublant quand ses
+  événements se croisent), Liste et Exécutions (actions prévues dans les
+  24 heures et dernières exécutions).
+- **Glisser-déposer** à la souris dans la vue Semaine : déplacer un événement,
+  y compris vers un autre jour, ou tirer son bord bas pour changer sa fin ;
+  pour un événement récurrent, choix de la portée.
+- **Éditeur d'événement complet** : portée (celle-ci, et les suivantes, toute
+  la série), titre, couleur, icône, agenda, horaires, répétition (avec règle
+  personnalisée), conditions et actions de début et de fin, note ; supprimer
+  et dupliquer.
+- **Conditions** : état d'une entité, valeur numérique (au-dessus, en
+  dessous, entre), ou YAML ; badges « remplie / non remplie » en direct.
+- **Actions** : thermostat, allumer / éteindre, option, attente,
+  notification (variables à insérer et aperçu), scène ou script, « si…
+  alors… sinon », autre service, YAML ; vérifiées par Home Assistant à
+  l'enregistrement.
+- **Cartes** de conditions et d'actions : poignée de déplacement à gauche,
+  copier, supprimer (avec annulation), flèche de repli à droite.
+- **Colonne des agendas** : affichage, état en cours ou prochain événement,
+  suspension, couleur, renommage, création d'un agenda ; autres calendriers
+  de Home Assistant affichés hachurés, pour information.
+
+### Moteur
+
+- Couleur (`COLOR`, RFC 7986) et icône par événement, conservées par toutes
+  les modifications, y compris depuis le calendrier de Home Assistant.
+- Suspension d'un agenda : plus aucune action tant qu'il est suspendu.
+- Historique des 100 dernières exécutions, enregistré avec l'état du
+  scheduleur.
+- Nouvelles commandes WebSocket pour le panneau (occurrences, lecture et
+  enregistrement d'un événement par portée, suppression, réglages d'un
+  agenda, création d'un agenda, historique, YAML).
+- Le nom affiché d'un agenda suit le titre de son entrée, qui peut être
+  renommé ; le fichier `.ics` garde son nom.
+
 ## 1.3.0 – 2026-11-10
 
 Le moteur reprend trois idées de l'intégration

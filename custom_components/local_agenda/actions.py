@@ -153,6 +153,11 @@ def set_actions_block(description: str | None, actions: dict[str, Any]) -> str:
     return (description.strip() + sep + block).strip()
 
 
+def strip_actions_block(description: str | None) -> str:
+    """The description without its actions block: the free note."""
+    return _ANY_ACTIONS_BLOCK_RE.sub("", description or "").strip()
+
+
 # ---------------------------------------------------------------------------
 # Condition evaluation
 # ---------------------------------------------------------------------------
@@ -378,8 +383,11 @@ async def fire_actions(
     event_summary: str,
     phase: str,
     variables: dict[str, Any] | None = None,
-) -> None:
+) -> str:
     """Execute the on_start or on_stop config for one event phase.
+
+    Returns what happened: "ran", "conditions" (not met), "empty" or
+    "invalid".
 
     Accepts either:
     - a list  → the actions (no conditions)
@@ -398,13 +406,13 @@ async def fire_actions(
         if conditions and not await _conditions_pass(
             hass, conditions, event_summary, phase
         ):
-            return
+            return "conditions"
     else:
         _LOGGER.warning(
             "local_agenda: unexpected actions format for '%s' [%s]: %s",
             event_summary, phase, type(phase_config),
         )
-        return
+        return "invalid"
     if not isinstance(steps, list):
         steps = [steps]
     # As before 1.3.0, an entry that is not a mapping is skipped on its own
@@ -416,7 +424,7 @@ async def fire_actions(
             )
     steps = [step for step in steps if isinstance(step, dict)]
     if not steps:
-        return
+        return "empty"
 
     variables = {
         "agenda": "",
@@ -434,3 +442,4 @@ async def fire_actions(
             _start(hass, _async_run(hass, [step], f"{name} #{index}", variables), name)
     else:
         _start(hass, _async_run(hass, steps, name, variables), name)
+    return "ran"

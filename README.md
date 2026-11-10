@@ -119,11 +119,13 @@ La syntaxe complète est décrite dans le wiki : [Syntaxe des actions](https://g
 
 ## Panneau Local Agenda
 
-Une entrée **Local Agenda** s'ajoute à la barre latérale de Home Assistant. Ce panneau permet de modifier les conditions et les appels de service d'un événement avec un formulaire, sans écrire le YAML à la main. Les badges **remplie / non remplie** indiquent en direct si une condition est satisfaite.
+Une entrée **Local Agenda** s'ajoute à la barre latérale de Home Assistant. Depuis la version 1.4.0, ce panneau permet de tout faire sans écrire de YAML :
 
-<img src="images/panneau-condition.jpg" alt="Panneau Local Agenda : une condition dépliée" width="800">
+- cinq vues : **Semaine** (glisser-déposer des événements), **Mois**, **Maison** (tous les agendas sur une journée), **Liste** et **Exécutions** (ce qui va partir et ce qui est parti) ;
+- un éditeur d'événement complet : horaires, répétition, couleur et icône, conditions et actions de début et de fin ;
+- les autres calendriers de Home Assistant affichés pour information, et la suspension d'un agenda en un clic.
 
-> ⚠️ Ce panneau est récent et n'a pas encore été complètement éprouvé. La méthode de référence reste la saisie du bloc YAML dans la description de l'événement.
+Les blocs YAML écrits à la main restent pris en charge et sont conservés à l'identique.
 
 Voir [Panneau Local Agenda](https://github.com/slemeur91/local_agenda/wiki/Panneau-Local-Agenda) dans le wiki.
 

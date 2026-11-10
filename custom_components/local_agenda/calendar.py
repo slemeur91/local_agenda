@@ -33,7 +33,9 @@ async def async_setup_entry(
 ) -> None:
     """Set up the calendar platform from a config entry."""
     store: LocalAgendaStore = hass.data[DOMAIN][config_entry.entry_id]["store"]
-    name = config_entry.data.get(CONF_CALENDAR_NAME, "Local Agenda")
+    # The title is what the panel can rename; the name in `data` only
+    # identifies the .ics file and never changes.
+    name = config_entry.title or config_entry.data.get(CONF_CALENDAR_NAME, "Local Agenda")
 
     entity = LocalAgendaEntity(hass, store, name, config_entry.entry_id)
     async_add_entities([entity], True)
@@ -125,9 +127,19 @@ class LocalAgendaEntity(CalendarEntity):
             self._expand_events, start_date, end_date
         )
 
-    def _expand_events(
+    def expand_for_panel(
         self, start_date: datetime, end_date: datetime
-    ) -> list[CalendarEvent]:
+    ) -> list[dict[str, Any]]:
+        """Occurrences in range as dicts for the panel (blocking).
+
+        Times are wall-clock times in Home Assistant's time zone, so the panel
+        never has to deal with time zones.
+        """
+        return self._expand_events(start_date, end_date, as_dicts=True)
+
+    def _expand_events(
+        self, start_date: datetime, end_date: datetime, as_dicts: bool = False
+    ) -> list[Any]:
         """Expand all events in range.
 
         The whole calendar is expanded in one pass.  Only if that fails —
@@ -143,21 +155,29 @@ class LocalAgendaEntity(CalendarEntity):
         # dialog would otherwise show every recurring event as "never").
         events_by_uid: dict[str, list] = defaultdict(list)
         rrule_by_uid: dict[str, str] = {}
+        # (uid, RECURRENCE-ID) of the occurrences edited on their own.
+        overrides: set[tuple[str, str]] = set()
         for vevent in cal.subcomponents:
             if vevent.name != "VEVENT":
                 continue
             uid = str(vevent.get("UID", "_no_uid_"))
             events_by_uid[uid].append(vevent)
-            if vevent.get("RECURRENCE-ID") is None:
+            rid = vevent.get("RECURRENCE-ID")
+            if rid is None:
                 rrule_str = _rrule_to_str(vevent.get("RRULE"))
                 if rrule_str is not None:
                     rrule_by_uid[uid] = rrule_str
+            else:
+                overrides.add((uid, _rid_to_str(rid) or ""))
 
-        def _convert(occurrences: list) -> list[CalendarEvent]:
+        def _convert(occurrences: list) -> list[Any]:
             converted = []
             for occ in occurrences:
                 uid = str(occ.get("UID", "_no_uid_"))
-                evt = _component_to_event(occ, rrule_override=rrule_by_uid.get(uid))
+                if as_dicts:
+                    evt = _component_to_dict(occ, rrule_by_uid.get(uid), overrides)
+                else:
+                    evt = _component_to_event(occ, rrule_override=rrule_by_uid.get(uid))
                 if evt is not None:
                     converted.append(evt)
             return converted
@@ -177,7 +197,10 @@ class LocalAgendaEntity(CalendarEntity):
                 cal, events_by_uid, _convert, start_date, end_date
             )
 
-        events.sort(key=lambda e: _as_utc(e.start))
+        if as_dicts:
+            events.sort(key=lambda e: e["start"])
+        else:
+            events.sort(key=lambda e: _as_utc(e.start))
         return events
 
     @staticmethod
@@ -223,7 +246,7 @@ class LocalAgendaEntity(CalendarEntity):
         self.async_write_ha_state()
         self._notify_panel_updated()
 
-    async def async_create_event(self, **kwargs: Any) -> None:
+    async def async_create_event(self, **kwargs: Any) -> str:
         """Create a new event (called by HA frontend)."""
         _LOGGER.debug("local_agenda: create_event kwargs keys=%s", list(kwargs.keys()))
         # Normalise start/end — HA may use dtstart OR start_date_time/start_date
@@ -249,8 +272,12 @@ class LocalAgendaEntity(CalendarEntity):
             component.add("location", loc)
         if rrule is not None:
             component.add("rrule", rrule)
+        for key, prop in _PROP_FIELDS.items():
+            if value := kwargs.get(key):
+                component.add(prop, value)
         self._store.get_calendar().add_component(component)
         await self._async_saved()
+        return str(component["uid"])
 
     async def async_delete_event(
         self,
@@ -364,6 +391,11 @@ class LocalAgendaEntity(CalendarEntity):
 _NEXT_EVENT_HORIZONS_DAYS = (7, 60, 365)
 
 _TEXT_FIELDS = ("summary", "description", "location")
+
+# Panel-only fields: key in the edit dict → iCalendar property.  COLOR is
+# standard (RFC 7986, a CSS color name); the icon is specific to Local Agenda.
+# Home Assistant's own calendar dialog never sends them, so it keeps them.
+_PROP_FIELDS = {"color": "color", "icon": "x-local-agenda-icon"}
 
 
 def _rrule_to_str(rrule_prop: Any) -> str | None:
@@ -506,6 +538,11 @@ def _apply_text_fields(component: Event, event: dict[str, Any]) -> None:
             component.add(field, value or "")
         elif value:
             component.add(field, value)
+    for key, prop in _PROP_FIELDS.items():
+        if key in event:
+            component.pop(prop, None)
+            if event[key]:
+                component.add(prop, event[key])
 
 
 def _set_times(
@@ -645,7 +682,7 @@ def _update_single_occurrence(
         target.add("dtstamp", dt_util.utcnow())
         target.add("recurrence-id", rec_dt)
         # Seed non-time fields from master so nothing is lost
-        for field in _TEXT_FIELDS:
+        for field in (*_TEXT_FIELDS, *_PROP_FIELDS.values()):
             value = master.get(field)
             if value is not None:
                 target.add(field, value)
@@ -705,8 +742,8 @@ def _update_this_and_future(
         new_series.add("rrule", vRecur.from_ical(original_rrule))
 
     # Text fields: prefer event dict, fall back to master
-    for field in _TEXT_FIELDS:
-        value = event.get(field)
+    for key, field in (*((f, f) for f in _TEXT_FIELDS), *_PROP_FIELDS.items()):
+        value = event.get(key)
         if value is not None:
             if value:
                 new_series.add(field, value)
@@ -795,6 +832,63 @@ def _component_to_event(
             rrule=rrule_str,
             recurrence_id=recurrence_id_str,
         )
+    except Exception as err:
+        _LOGGER.debug("Skipping malformed VEVENT: %s", err)
+        return None
+
+
+def _rid_to_str(rid: Any) -> str | None:
+    try:
+        return rid.to_ical().decode("utf-8")
+    except Exception:
+        return None
+
+
+def wall(value: date | datetime) -> str:
+    """A date or datetime as wall-clock text in Home Assistant's time zone.
+
+    "2026-11-10" for a date, "2026-11-10T06:30" for a datetime; a floating
+    datetime (no time zone) is already wall-clock time.
+    """
+    if not isinstance(value, datetime):
+        return value.isoformat()
+    if value.tzinfo is not None:
+        value = dt_util.as_local(value)
+    return value.strftime("%Y-%m-%dT%H:%M")
+
+
+def _component_to_dict(
+    component: Any, rrule: str | None, overrides: set[tuple[str, str]]
+) -> dict[str, Any] | None:
+    """An occurrence as the panel shows it."""
+    from .actions import parse_actions, strip_actions_block
+
+    try:
+        dtstart = component.get("dtstart")
+        if dtstart is None:
+            return None
+        start = dtstart.dt
+        dtend = component.get("dtend")
+        end = dtend.dt if dtend else start
+        uid = str(component.get("uid", ""))
+        rid = component.get("RECURRENCE-ID")
+        rid_str = _rid_to_str(rid) if rid is not None else None
+        description = str(component.get("description", "") or "")
+        return {
+            "uid": uid,
+            "recurrence_id": rid_str,
+            "summary": str(component.get("summary", "")),
+            "start": wall(start),
+            "end": wall(end),
+            "all_day": not isinstance(start, datetime),
+            "rrule": rrule,
+            "note": strip_actions_block(description),
+            "location": str(component.get("location", "") or ""),
+            "actions": parse_actions(description),
+            "color": str(component.get("color", "") or "") or None,
+            "icon": str(component.get("x-local-agenda-icon", "") or "") or None,
+            "is_exception": bool(rrule) and (uid, rid_str or "") in overrides,
+        }
     except Exception as err:
         _LOGGER.debug("Skipping malformed VEVENT: %s", err)
         return None

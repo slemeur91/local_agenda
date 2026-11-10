@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 import datetime as _dt
 import logging
+from collections import deque
 from datetime import datetime, timedelta
 from typing import Any
 
@@ -51,6 +52,8 @@ MAX_CATCH_UP = timedelta(days=7)
 LOOKAHEAD = timedelta(minutes=1)
 
 STORAGE_VERSION = 1
+# Executions kept for the panel's "Exécutions" view.
+HISTORY_SIZE = 100
 
 
 class _CalendarUnreadable(Exception):
@@ -101,6 +104,7 @@ class AgendaScheduler:
         self._unsubs: list[CALLBACK_TYPE] = []
         self._unsub_timer: CALLBACK_TYPE | None = None
         self._stopped = False
+        self._history: deque[dict[str, Any]] = deque(maxlen=HISTORY_SIZE)
 
     # ------------------------------------------------------------------
     # Life cycle
@@ -119,6 +123,7 @@ class AgendaScheduler:
             last = now  # first run, or a clock that was badly wrong
         self._last = max(last, now - MAX_CATCH_UP)
         self._running = dict(data.get("running") or {})
+        self._history.extend(data.get("history") or [])
         self._unsubs.append(async_at_started(self._hass, self._async_started))
 
     async def _async_started(self, _hass: HomeAssistant) -> None:
@@ -219,8 +224,9 @@ class AgendaScheduler:
             .get("entities", [])
             if entity.enabled
         ]
-        if not entities:
-            # A disabled calendar runs nothing and keeps what it tracks.
+        if not entities or self.suspended:
+            # A disabled or suspended calendar runs nothing and keeps what
+            # it tracks; what falls in the meantime is not caught up.
             self._set_timer(None)
             return False
 
@@ -304,7 +310,8 @@ class AgendaScheduler:
                     "local_agenda: '%s' started and ended while Home Assistant "
                     "was stopped — skipped", evt.summary,
                 )
-                return False
+                self._record(evt.summary, uid, start, "start", "missed", moment)
+                return True
             if actions.get("on_stop"):
                 self._running[key] = {
                     "uid": uid,
@@ -318,8 +325,12 @@ class AgendaScheduler:
                         "local_agenda: catching up the start of '%s' (%s)",
                         evt.summary, start,
                     )
-                await fire_actions(
+                status = await fire_actions(
                     self._hass, actions["on_start"], evt.summary, "start", variables
+                )
+                self._record(
+                    evt.summary, uid, start, "start", status, moment,
+                    "catch_up" if late else None,
                 )
             return True
 
@@ -330,7 +341,12 @@ class AgendaScheduler:
             _LOGGER.info(
                 "local_agenda: catching up the end of '%s' (%s)", evt.summary, end
             )
-        await fire_actions(self._hass, actions["on_stop"], evt.summary, "stop", variables)
+        status = await fire_actions(
+            self._hass, actions["on_stop"], evt.summary, "stop", variables
+        )
+        self._record(
+            evt.summary, uid, start, "stop", status, moment, "catch_up" if late else None
+        )
         return True
 
     async def _async_stop_vanished(self, in_progress: set[str], until: datetime) -> bool:
@@ -354,13 +370,60 @@ class AgendaScheduler:
                 "shortened) — running its on_stop", summary,
             )
             try:
-                await fire_actions(self._hass, info["on_stop"], summary, "stop", variables)
+                status = await fire_actions(
+                    self._hass, info["on_stop"], summary, "stop", variables
+                )
             except Exception:
                 _LOGGER.exception("local_agenda: on_stop failed for '%s'", summary)
+                status = "error"
+            start = dt_util.parse_datetime(key.split("|", 1)[1]) if "|" in key else None
+            self._record(summary, info["uid"], start, "stop", status, until, "vanished")
         return changed
+
+    # ------------------------------------------------------------------
+    # Panel
+    # ------------------------------------------------------------------
+
+    @property
+    def suspended(self) -> bool:
+        """Suspended from the panel: nothing runs until resumed."""
+        return bool(self._entry.options.get("suspended"))
+
+    @property
+    def history(self) -> list[dict[str, Any]]:
+        """Latest executions, most recent first."""
+        return list(reversed(self._history))
+
+    def _record(
+        self,
+        summary: str,
+        uid: str,
+        start: datetime | None,
+        phase: str,
+        status: str,
+        moment: datetime,
+        reason: str | None = None,
+    ) -> None:
+        """Remember an execution for the panel and tell open panels."""
+        self._history.append({
+            "at": dt_util.utcnow().isoformat(),
+            "planned": moment.isoformat(),
+            "uid": uid,
+            "start": start.isoformat() if start else None,
+            "summary": summary,
+            "phase": phase,
+            # ran / conditions / empty / invalid / missed / error
+            "status": status,
+            # None (on time) / catch_up / vanished
+            "reason": reason,
+        })
+        self._hass.bus.async_fire(
+            f"{DOMAIN}_history", {"entry_id": self._entry.entry_id}
+        )
 
     def _data(self) -> dict[str, Any]:
         return {
             "last": self._last.isoformat() if self._last else None,
             "running": self._running,
+            "history": list(self._history),
         }
