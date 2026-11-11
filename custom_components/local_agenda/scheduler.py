@@ -18,6 +18,12 @@ The scheduler also remembers the events whose start it handled and which
 have an on_stop.  If such an event disappears before its end (deleted, moved
 or shortened to an end already past), its on_stop runs immediately: a
 heating turned on by an event is turned off when that event is removed.
+
+A calendar that is disabled (its entity) or suspended runs nothing, and
+forgets the on_stop of its started events: they are not run late when it is
+enabled again.  With the `apply_on_enable` option, enabling or resuming the
+calendar runs the on_start of the events then in progress, as if they had
+just started.
 """
 from __future__ import annotations
 
@@ -86,6 +92,21 @@ def _event_variables(evt: Any, start: datetime, end: datetime) -> dict[str, Any]
     }
 
 
+class _Failure:
+    """Called by the actions when they fail; updates their history entry."""
+
+    def __init__(self, scheduler: AgendaScheduler) -> None:
+        self._scheduler = scheduler
+        self.item: dict[str, Any] | None = None
+        self.error: str | None = None
+
+    def __call__(self, error: str) -> None:
+        if self.error is None:
+            self.error = error
+        if self.item is not None:
+            self._scheduler._mark_failed(self.item, self.error)
+
+
 class AgendaScheduler:
     """Run the actions of one calendar (config entry)."""
 
@@ -104,6 +125,9 @@ class AgendaScheduler:
         self._unsubs: list[CALLBACK_TYPE] = []
         self._unsub_timer: CALLBACK_TYPE | None = None
         self._stopped = False
+        # Whether the calendar ran at the previous pass (enabled and not
+        # suspended).  Saved: disabling an entity reloads the integration.
+        self._active = True
         self._history: deque[dict[str, Any]] = deque(maxlen=HISTORY_SIZE)
 
     # ------------------------------------------------------------------
@@ -123,6 +147,7 @@ class AgendaScheduler:
             last = now  # first run, or a clock that was badly wrong
         self._last = max(last, now - MAX_CATCH_UP)
         self._running = dict(data.get("running") or {})
+        self._active = data.get("active", True)
         self._history.extend(data.get("history") or [])
         self._unsubs.append(async_at_started(self._hass, self._async_started))
 
@@ -225,10 +250,23 @@ class AgendaScheduler:
             if entity.enabled
         ]
         if not entities or self.suspended:
-            # A disabled or suspended calendar runs nothing and keeps what
-            # it tracks; what falls in the meantime is not caught up.
+            # A disabled or suspended calendar runs nothing, and what falls
+            # in the meantime is not caught up.  The on_stop of the started
+            # events are forgotten: run when the calendar comes back, they
+            # would undo hours later what something else may have set since.
+            changed = self._active or bool(self._running)
+            if self._running:
+                _LOGGER.info(
+                    "local_agenda: '%s' disabled or suspended — the end of %d "
+                    "event(s) in progress will not run",
+                    self._entry.title, len(self._running),
+                )
+            self._running.clear()
+            self._active = False
             self._set_timer(None)
-            return False
+            return changed
+        activating = not self._active
+        self._active = True
 
         events: list[Any] = []
         for entity in entities:
@@ -240,6 +278,9 @@ class AgendaScheduler:
                 raise _CalendarUnreadable(err) from err
 
         transitions: list[tuple[datetime, int, str, Any, dict, datetime, datetime]] = []
+        # Events already in progress when the calendar is enabled again.
+        resumed: list[tuple[Any, dict, datetime, datetime]] = []
+        apply_on_enable = activating and self.apply_on_enable
         in_progress: set[str] = set()
         next_at: datetime | None = None
         for evt in events:
@@ -252,6 +293,8 @@ class AgendaScheduler:
                 actions = parse_actions(getattr(evt, "description", "") or "")
                 if not actions:
                     continue
+                if apply_on_enable and start <= since and until < end:
+                    resumed.append((evt, actions, start, end))
                 # Ends before starts at the same moment: what an event turns
                 # off must not undo what the next one just turned on.
                 for moment, order, phase in ((end, 0, "stop"), (start, 1, "start")):
@@ -269,7 +312,15 @@ class AgendaScheduler:
                 )
 
         transitions.sort(key=lambda t: (t[0], t[1]))
-        changed = False
+        changed = activating
+        for evt, actions, start, end in sorted(resumed, key=lambda r: r[2]):
+            try:
+                await self._async_resume(evt, actions, start, end, until)
+            except Exception:
+                _LOGGER.exception(
+                    "local_agenda: actions failed for event '%s'",
+                    getattr(evt, "summary", "?"),
+                )
         for moment, _order, phase, evt, actions, start, end in transitions:
             try:
                 changed |= await self._async_transition(
@@ -325,12 +376,14 @@ class AgendaScheduler:
                         "local_agenda: catching up the start of '%s' (%s)",
                         evt.summary, start,
                     )
+                failure = _Failure(self)
                 status = await fire_actions(
-                    self._hass, actions["on_start"], evt.summary, "start", variables
+                    self._hass, actions["on_start"], evt.summary, "start", variables,
+                    failure,
                 )
                 self._record(
                     evt.summary, uid, start, "start", status, moment,
-                    "catch_up" if late else None,
+                    "catch_up" if late else None, failure,
                 )
             return True
 
@@ -341,13 +394,44 @@ class AgendaScheduler:
             _LOGGER.info(
                 "local_agenda: catching up the end of '%s' (%s)", evt.summary, end
             )
+        failure = _Failure(self)
         status = await fire_actions(
-            self._hass, actions["on_stop"], evt.summary, "stop", variables
+            self._hass, actions["on_stop"], evt.summary, "stop", variables, failure
         )
         self._record(
-            evt.summary, uid, start, "stop", status, moment, "catch_up" if late else None
+            evt.summary, uid, start, "stop", status, moment,
+            "catch_up" if late else None, failure,
         )
         return True
+
+    async def _async_resume(
+        self, evt: Any, actions: dict, start: datetime, end: datetime, until: datetime
+    ) -> None:
+        """Start an event already in progress when the calendar is enabled."""
+        uid = getattr(evt, "uid", None) or evt.summary or "?"
+        variables = {
+            "agenda": self._entry.title,
+            "event": _event_variables(evt, start, end),
+        }
+        if actions.get("on_stop"):
+            self._running[f"{uid}|{start.isoformat()}"] = {
+                "uid": uid,
+                "end": end.isoformat(),
+                "on_stop": actions["on_stop"],
+                "variables": variables,
+            }
+        if actions.get("on_start"):
+            _LOGGER.info(
+                "local_agenda: '%s' enabled — applying '%s', in progress",
+                self._entry.title, evt.summary,
+            )
+            failure = _Failure(self)
+            status = await fire_actions(
+                self._hass, actions["on_start"], evt.summary, "start", variables, failure
+            )
+            self._record(
+                evt.summary, uid, start, "start", status, until, "enabled", failure
+            )
 
     async def _async_stop_vanished(self, in_progress: set[str], until: datetime) -> bool:
         """Run on_stop for started events that are no longer in progress.
@@ -369,15 +453,18 @@ class AgendaScheduler:
                 "local_agenda: '%s' is no longer in progress (deleted, moved or "
                 "shortened) — running its on_stop", summary,
             )
+            failure = _Failure(self)
             try:
                 status = await fire_actions(
-                    self._hass, info["on_stop"], summary, "stop", variables
+                    self._hass, info["on_stop"], summary, "stop", variables, failure
                 )
             except Exception:
                 _LOGGER.exception("local_agenda: on_stop failed for '%s'", summary)
                 status = "error"
             start = dt_util.parse_datetime(key.split("|", 1)[1]) if "|" in key else None
-            self._record(summary, info["uid"], start, "stop", status, until, "vanished")
+            self._record(
+                summary, info["uid"], start, "stop", status, until, "vanished", failure
+            )
         return changed
 
     # ------------------------------------------------------------------
@@ -388,6 +475,11 @@ class AgendaScheduler:
     def suspended(self) -> bool:
         """Suspended from the panel: nothing runs until resumed."""
         return bool(self._entry.options.get("suspended"))
+
+    @property
+    def apply_on_enable(self) -> bool:
+        """Run the events in progress when the calendar is enabled again."""
+        return bool(self._entry.options.get("apply_on_enable"))
 
     @property
     def history(self) -> list[dict[str, Any]]:
@@ -403,9 +495,14 @@ class AgendaScheduler:
         status: str,
         moment: datetime,
         reason: str | None = None,
+        failure: _Failure | None = None,
     ) -> None:
-        """Remember an execution for the panel and tell open panels."""
-        self._history.append({
+        """Remember an execution for the panel and tell open panels.
+
+        The actions run in the background: `failure` updates the entry if
+        they fail, now or later.
+        """
+        item = {
             "at": dt_util.utcnow().isoformat(),
             "planned": moment.isoformat(),
             "uid": uid,
@@ -414,16 +511,36 @@ class AgendaScheduler:
             "phase": phase,
             # ran / conditions / empty / invalid / missed / error
             "status": status,
-            # None (on time) / catch_up / vanished
+            # None (on time) / catch_up / vanished / enabled
             "reason": reason,
-        })
+        }
+        if failure is not None and failure.error is not None:
+            item["status"] = "error"
+            item["error"] = failure.error
+        self._history.append(item)
+        if failure is not None:
+            failure.item = item
         self._hass.bus.async_fire(
             f"{DOMAIN}_history", {"entry_id": self._entry.entry_id}
         )
+
+    @callback
+    def _mark_failed(self, item: dict[str, Any], error: str) -> None:
+        """Actions started earlier failed: show it in the history."""
+        if item.get("status") == "error":
+            return
+        item["status"] = "error"
+        item["error"] = error
+        self._hass.bus.async_fire(
+            f"{DOMAIN}_history", {"entry_id": self._entry.entry_id}
+        )
+        if not self._stopped:
+            self._store.async_delay_save(self._data, 10)
 
     def _data(self) -> dict[str, Any]:
         return {
             "last": self._last.isoformat() if self._last else None,
             "running": self._running,
+            "active": self._active,
             "history": list(self._history),
         }

@@ -84,6 +84,7 @@ def ws_list_calendars(
                 "entity_id": entity_id,
                 "color": entry.options.get("color"),
                 "suspended": bool(entry.options.get("suspended")),
+                "apply_on_enable": bool(entry.options.get("apply_on_enable")),
                 "disabled": bool(reg_entry and reg_entry.disabled_by),
             }
         )
@@ -550,13 +551,18 @@ async def ws_event_save(
             # A new event, or a whole series moved to another calendar.
             if uid and msg["scope"] != "all":
                 raise vol.Invalid("only a whole series can move to another calendar")
+            if uid:
+                # Exceptions and deleted occurrences go with the series.
+                fields["rrule"] = event.get("rrule") or ""
+                new_uid = await entity.async_move_series(
+                    uid, fields, _entity(hass, target)
+                )
+                return {"uid": new_uid}
             create = {k: v for k, v in fields.items() if v not in (None, "")}
             create["summary"] = fields["summary"]
             if event.get("rrule"):
                 create["rrule"] = event["rrule"]
             new_uid = await _entity(hass, target).async_create_event(**create)
-            if uid:
-                await entity.async_delete_event(uid)
             return {"uid": new_uid}
 
         if msg["scope"] == "this":
@@ -616,6 +622,7 @@ async def ws_event_delete(
         vol.Required("entry_id"): str,
         vol.Optional("color"): vol.Any(None, str),
         vol.Optional("suspended"): bool,
+        vol.Optional("apply_on_enable"): bool,
         vol.Optional("name"): vol.All(str, vol.Length(min=1)),
     }
 )
@@ -628,7 +635,7 @@ async def ws_agenda_update(
         if entry is None or entry.domain != DOMAIN:
             raise HomeAssistantError("Calendar entry not found")
         options = dict(entry.options)
-        for key in ("color", "suspended"):
+        for key in ("color", "suspended", "apply_on_enable"):
             if key in msg:
                 options[key] = msg[key]
         title = msg.get("name", "").strip() or entry.title

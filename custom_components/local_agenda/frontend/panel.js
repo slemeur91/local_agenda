@@ -8,7 +8,7 @@
 // ("2026-11-10T06:30", or "2026-11-10" for an all-day event), so the panel
 // never converts between time zones itself.
 
-const VERSION = "2.0.3";
+const VERSION = "2.0.4";
 console.info(`%c[local_agenda] panel.js v${VERSION} loaded`, "color:#03a9f4;font-weight:bold;");
 
 // ---------------------------------------------------------------------------
@@ -2120,7 +2120,7 @@ class LocalAgendaPanel extends HTMLElement {
     this.shadowRoot.replaceChildren(style, this._root);
     this._unsubs = [];
     if (this._hass.connection) {
-      const later = () => { clearTimeout(this._reloadT); this._reloadT = setTimeout(() => this.reload(), 300); };
+      const later = () => { clearTimeout(this._reloadT); this._reloadT = setTimeout(() => this.reload(true), 300); };
       this._unsubs.push(this._hass.connection.subscribeEvents(later, "local_agenda_updated"));
       this._unsubs.push(this._hass.connection.subscribeEvents(() => { if (this.view === "runs") later(); }, "local_agenda_history"));
       // A calendar entity enabled or disabled (by hand, or by an automation).
@@ -2143,7 +2143,13 @@ class LocalAgendaPanel extends HTMLElement {
 
   startTimer() {
     clearInterval(this._timer);
-    this._timer = setInterval(() => { this.loadStatus().then(() => this.renderAll(true)); }, 60000);
+    this._timer = setInterval(() => { this.loadStatus().then(() => this.renderAll(true, true)); }, 60000);
+  }
+
+  // A drag, a move waiting for its scope or an open menu must not be wiped
+  // out by an automatic refresh: it waits until they are over.
+  isBusy() {
+    return !!(this._dragging || this._moving || this.shadowRoot.querySelector(".menu"));
   }
 
   // ---------- data ----------
@@ -2158,7 +2164,7 @@ class LocalAgendaPanel extends HTMLElement {
     }
   }
 
-  async reload() {
+  async reload(auto = false) {
     try {
       this._cals = await this.ws({ type: "local_agenda/list_calendars" });
       const [a, b] = this.range();
@@ -2168,7 +2174,7 @@ class LocalAgendaPanel extends HTMLElement {
     } catch (e) {
       this.toast(`Chargement impossible : ${e.message || e}`, null, null, "error");
     }
-    this.renderAll(true);
+    this.renderAll(true, auto);
   }
 
   async loadStatus() {
@@ -2229,8 +2235,13 @@ class LocalAgendaPanel extends HTMLElement {
   }
 
   // ---------- shell ----------
-  renderAll(keepScroll = false) {
+  renderAll(keepScroll = false, auto = false) {
     if (!this._root) return;
+    clearTimeout(this._deferT);
+    if (auto && this.isBusy()) {
+      this._deferT = setTimeout(() => this.renderAll(keepScroll, true), 1000);
+      return;
+    }
     const scroll = this._root.querySelector(".scroll");
     const top = keepScroll && scroll ? scroll.scrollTop : null;
     const narrow = this.isNarrow;
@@ -2325,6 +2336,9 @@ class LocalAgendaPanel extends HTMLElement {
         { label: "Couleur de l'agenda", icon: "mdi:palette-outline", action: () => this.pickAgendaColor(c) },
         { label: "Renommer", icon: "mdi:pencil-outline", action: () => this.renameAgenda(c) },
         { label: c.suspended ? "Reprendre" : "Suspendre", icon: c.suspended ? "mdi:play" : "mdi:pause", action: () => this.setSuspended(c, !c.suspended) },
+        "-",
+        { label: "Appliquer l'événement en cours à l'activation", icon: c.apply_on_enable ? "mdi:checkbox-marked-outline" : "mdi:checkbox-blank-outline",
+          action: () => this.setApplyOnEnable(c, !c.apply_on_enable) },
       ]));
       const canShow = !c.disabled || this.prefs.showDisabled;
       return el("div", { class: `calrow ${c.suspended || c.disabled ? "off" : ""}` },
@@ -2482,6 +2496,7 @@ class LocalAgendaPanel extends HTMLElement {
         if (!dragging && Math.hypot(ev.clientX - startX, ev.clientY - startY) < 5) return;
         if (!dragging) {
           dragging = true;
+          this._dragging = true;
           try { b.setPointerCapture(e.pointerId); } catch (err) { /* pointer already gone */ }
           b.classList.add("dragging");
         }
@@ -2501,6 +2516,7 @@ class LocalAgendaPanel extends HTMLElement {
         b.removeEventListener("pointermove", move);
         b.removeEventListener("pointerup", up);
         b.removeEventListener("pointercancel", cancel);
+        this._dragging = false;
         if (!dragging) { this.openOcc(it); return; }
         b.classList.remove("dragging");
         let ns = it.s, ne = it.e;
@@ -2513,6 +2529,7 @@ class LocalAgendaPanel extends HTMLElement {
       // A touch that turns into a scroll cancels the pointer: nothing to undo then.
       const cancel = () => {
         b.removeEventListener("pointermove", move); b.removeEventListener("pointerup", up);
+        this._dragging = false;
         if (dragging) { b.classList.remove("dragging"); this.renderAll(true); }
       };
       b.addEventListener("pointermove", move);
@@ -2524,10 +2541,11 @@ class LocalAgendaPanel extends HTMLElement {
   async applyMove(it, ns, ne) {
     const o = it.occ;
     let scope = "all";
+    this._moving = true;
     if (o.rrule) {
       scope = await this.choose(`Déplacer « ${o.summary || "sans titre"} »`, [
         ["this", "Cette occurrence"], ["future", "Celle-ci et les suivantes"], ["all", "Toute la série"]]);
-      if (!scope) { this.renderAll(true); return; }
+      if (!scope) { this._moving = false; this.renderAll(true); return; }
     }
     try {
       let src = o, start = ns, end = ne;
@@ -2546,6 +2564,7 @@ class LocalAgendaPanel extends HTMLElement {
     } catch (e) {
       this.toast(`Déplacement refusé : ${e.message || e}`, null, null, "error");
     }
+    this._moving = false;
     this.reload();
   }
 
@@ -2683,8 +2702,9 @@ class LocalAgendaPanel extends HTMLElement {
       if (h.reason === "vanished") return ["arrêt immédiat (événement retiré)", "info"];
       if (h.status === "missed") return ["manqué (Home Assistant arrêté)", "ko"];
       if (h.status === "conditions") return ["conditions non remplies", "ko"];
-      if (h.status === "error" || h.status === "invalid") return ["erreur, voir les logs", "err"];
+      if (h.status === "error" || h.status === "invalid") return [h.error ? "erreur" : "erreur, voir les logs", "err"];
       if (h.reason === "catch_up") return ["rattrapé au redémarrage", "info"];
+      if (h.reason === "enabled") return ["appliqué à l'activation", "info"];
       return ["exécuté", "ok"];
     };
     for (const h of this._history.slice(0, 60)) {
@@ -2696,8 +2716,8 @@ class LocalAgendaPanel extends HTMLElement {
         el("span", { text: at === null ? "" : (dayOf(at) === dayOf(now) ? wTime(at) : `${fmtDay(at)} ${wTime(at)}`) }),
         el("span", { class: "dot", style: `background:${this.calColor(h.entry_id)}` }),
         el("span", {}, el("div", { text: `${h.summary || "(sans titre)"} · ${h.phase === "start" ? "début" : "fin"}` }),
-          el("div", { class: "sub", text: c ? c.name : "" })),
-        el("span", { class: `tag ${kind}`, text: label })));
+          el("div", { class: "sub", text: [c ? c.name : "", h.error || ""].filter(Boolean).join(" · ") })),
+        el("span", { class: `tag ${kind}`, text: label, title: h.error || "" })));
     }
     return el("div", { class: "scroll" }, box);
   }
@@ -2732,6 +2752,16 @@ class LocalAgendaPanel extends HTMLElement {
     try { await this.ws({ type: "local_agenda/agenda/update", entry_id: cal.entry_id, suspended }); }
     catch (e) { this.toast(`Impossible : ${e.message || e}`, null, null, "error"); }
     this.toast(suspended ? `${cal.name} suspendu : aucune action ne sera exécutée` : `${cal.name} repris`);
+    this.reload();
+  }
+
+  async setApplyOnEnable(cal, value) {
+    try {
+      await this.ws({ type: "local_agenda/agenda/update", entry_id: cal.entry_id, apply_on_enable: value });
+      this.toast(value
+        ? `${cal.name} : à l'activation ou à la reprise, l'événement en cours sera appliqué`
+        : `${cal.name} : à l'activation, seuls les événements suivants s'appliqueront`);
+    } catch (e) { this.toast(`Impossible : ${e.message || e}`, null, null, "error"); }
     this.reload();
   }
 

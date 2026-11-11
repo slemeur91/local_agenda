@@ -67,7 +67,8 @@ import copy
 import json
 import logging
 import re
-from typing import Any
+from collections import OrderedDict
+from typing import Any, Callable
 
 import voluptuous as vol
 import yaml
@@ -92,6 +93,12 @@ ACTIONS_BLOCK_RE = re.compile(
 # be read, so that saving replaces it instead of appending a second block.
 _ANY_ACTIONS_BLOCK_RE = re.compile(r"---actions---.*?---/actions---", re.DOTALL)
 
+
+# Invalid blocks already reported (bounded).
+_WARNED_YAML: set[str] = set()
+_WARNED_MAX = 200
+# Scripts kept built (least recently used dropped first).
+_SCRIPTS_MAX = 64
 
 # ---------------------------------------------------------------------------
 # Parsing
@@ -125,7 +132,15 @@ def parse_actions(description: str | None) -> dict[str, Any]:
                 result[phase] = value
         return result
     except Exception as exc:
-        _LOGGER.warning("local_agenda: failed to parse actions YAML: %s", exc)
+        # Read again at every pass: warn once per block, not every 20 s.
+        text = match.group(1)
+        if text not in _WARNED_YAML:
+            if len(_WARNED_YAML) >= _WARNED_MAX:
+                _WARNED_YAML.clear()
+            _WARNED_YAML.add(text)
+            _LOGGER.warning("local_agenda: failed to parse actions YAML: %s", exc)
+        else:
+            _LOGGER.debug("local_agenda: failed to parse actions YAML: %s", exc)
         return {}
 
 
@@ -338,9 +353,11 @@ async def _async_script(
     hass: HomeAssistant, steps: list, name: str
 ) -> Script:
     """Return the Script for `steps`, validated and built once."""
-    scripts: dict[str, Script] = hass.data.setdefault(_SCRIPTS_KEY, {})
+    scripts: OrderedDict[str, Script] = hass.data.setdefault(_SCRIPTS_KEY, OrderedDict())
     key = json.dumps([name, steps], sort_keys=True, default=str)
-    if (script := scripts.get(key)) is None:
+    if (script := scripts.get(key)) is not None:
+        scripts.move_to_end(key)
+    else:
         validated = await async_validate_actions_config(
             hass, cv.SCRIPT_SCHEMA(copy.deepcopy(steps))
         )
@@ -354,6 +371,8 @@ async def _async_script(
             logger=_LOGGER,
         )
         scripts[key] = script
+        while len(scripts) > _SCRIPTS_MAX:
+            scripts.popitem(last=False)
     return script
 
 
@@ -362,17 +381,22 @@ async def _async_run(
     steps: list,
     name: str,
     variables: dict[str, Any],
+    on_error: Callable[[str], None] | None = None,
 ) -> None:
-    """Validate and run one script; errors are logged, never raised."""
+    """Validate and run one script; errors are logged and reported."""
     try:
         script = await _async_script(hass, steps, name)
     except (vol.Invalid, HomeAssistantError) as err:
         _LOGGER.error("local_agenda: invalid actions for %s: %s", name, err)
+        if on_error is not None:
+            on_error(str(err))
         return
     try:
         await script.async_run(run_variables=variables, context=Context())
-    except Exception:  # the script engine has logged the failing step
+    except Exception as err:  # the script engine has logged the failing step
         _LOGGER.debug("local_agenda: actions for %s stopped on an error", name)
+        if on_error is not None:
+            on_error(str(err) or type(err).__name__)
 
 
 def _start(hass: HomeAssistant, coro: Any, name: str) -> None:
@@ -386,6 +410,7 @@ async def fire_actions(
     event_summary: str,
     phase: str,
     variables: dict[str, Any] | None = None,
+    on_error: Callable[[str], None] | None = None,
 ) -> str:
     """Execute the on_start or on_stop config for one event phase.
 
@@ -442,7 +467,11 @@ async def fire_actions(
         # Historical behaviour: every call on its own, launched in order,
         # none waiting for or stopped by another.
         for index, step in enumerate(steps, start=1):
-            _start(hass, _async_run(hass, [step], f"{name} #{index}", variables), name)
+            _start(
+                hass,
+                _async_run(hass, [step], f"{name} #{index}", variables, on_error),
+                name,
+            )
     else:
-        _start(hass, _async_run(hass, steps, name, variables), name)
+        _start(hass, _async_run(hass, steps, name, variables, on_error), name)
     return "ran"

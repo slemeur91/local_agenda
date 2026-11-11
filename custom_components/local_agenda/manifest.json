@@ -1,7 +1,7 @@
 {
   "domain": "local_agenda",
   "name": "Local Agenda",
-  "version": "1.4.1",
+  "version": "1.4.2",
   "codeowners": ["@slemeur91"],
   "config_flow": true,
   "dependencies": ["http", "frontend", "websocket_api"],

@@ -3,6 +3,49 @@
 Les versions antérieures à la 1.2.0 sont décrites dans les
 [releases GitHub](https://github.com/slemeur91/local_agenda/releases).
 
+## 1.4.2 – 2026-11-11
+
+Version de corrections issue d'un audit du code.
+
+### Ajout
+
+- **Option « Appliquer l'événement en cours à l'activation »** (menu ⋮ de
+  l'agenda dans le panneau) : quand l'agenda est réactivé dans Home
+  Assistant (à la main ou par une automatisation) ou repris après une
+  suspension, les actions de début des événements alors en cours sont
+  exécutées aussitôt, et leur fin sera exécutée à l'heure. Désactivée par
+  défaut : seuls les événements suivants s'appliquent, comme avant.
+
+### Corrections
+
+- **Agenda désactivé ou suspendu** : la fin (`on_stop`) d'un événement qui
+  était en cours s'exécutait à la réactivation, parfois des heures plus
+  tard, et pouvait défaire ce qu'un autre agenda avait réglé entre-temps.
+  Elle est désormais abandonnée.
+- **Série déplacée vers un autre agenda** : ses occurrences modifiées et
+  supprimées étaient perdues (les occurrences supprimées réapparaissaient).
+  Elles sont maintenant recopiées avec la série. L'agenda d'origine n'est
+  modifié qu'une fois la copie enregistrée.
+- **Exécutions** : une action en échec (service inconnu, appareil
+  injoignable…) apparaissait comme « exécuté ». Elle est désormais marquée
+  « erreur », avec le message, dans la vue Exécutions.
+- **Logs** : un bloc d'actions au YAML invalide produisait un avertissement
+  toutes les 20 secondes ; il n'est plus signalé qu'une fois.
+- **Panneau (panel.js 2.0.4)** : le rafraîchissement automatique (chaque
+  minute ou après une modification) annulait un glisser-déposer en cours ou
+  fermait un menu ouvert ; il attend désormais la fin de l'opération. La vue
+  Exécutions affiche « appliqué à l'activation » et le message des erreurs.
+
+### Technique
+
+- Le calendrier lu par le scheduleur, le panneau et Home Assistant est
+  analysé une fois par version enregistrée, au lieu d'à chaque lecture.
+- Les scripts gardés en mémoire sont limités à 64 (les moins récemment
+  utilisés sont retirés) : la mémoire ne croît plus à chaque modification
+  d'un bloc d'actions.
+- L'état « actif » du scheduleur est enregistré avec son état, pour
+  reconnaître une réactivation après le rechargement de l'intégration.
+
 ## 1.4.1 – 2026-11-11
 
 ### Ajout

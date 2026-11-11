@@ -29,6 +29,8 @@ class LocalAgendaStore:
         # Raw bytes kept in sync with _calendar so read-only consumers
         # never need to hit the disk again.
         self._raw_bytes: bytes = _EMPTY_ICS
+        # (bytes, Calendar parsed from them) for the readers.
+        self._read_cache: tuple[bytes, Calendar] | None = None
         # Serialises disk writes so two saves can never interleave.
         self._write_lock = asyncio.Lock()
 
@@ -139,10 +141,19 @@ class LocalAgendaStore:
         return self._calendar
 
     def get_calendar_for_read(self) -> Calendar:
-        """Return a fresh Calendar parsed from the in-memory bytes cache.
+        """Return a Calendar parsed from the last saved bytes, for reading.
 
-        Always parses a new object so that libraries such as recurring_ical_events
-        — which mutate components in place — never corrupt the CRUD calendar.
-        No disk I/O: uses the bytes already in memory after the last load/save.
+        It is a separate object from the CRUD calendar, so an edit in
+        progress is never seen half-way.  It is parsed once per saved
+        version and shared by the readers (the scheduler every 20 s, the
+        panel, Home Assistant's calendar): they must not modify it.
+        recurring_ical_events does not — it builds new components for the
+        occurrences it returns.  No disk I/O.
         """
-        return Calendar.from_ical(self._raw_bytes)
+        raw = self._raw_bytes
+        cached = self._read_cache
+        if cached is not None and cached[0] is raw:
+            return cached[1]
+        cal = Calendar.from_ical(raw)
+        self._read_cache = (raw, cal)
+        return cal

@@ -1,6 +1,7 @@
 """Calendar platform for local_agenda."""
 from __future__ import annotations
 
+import copy
 import logging
 import uuid
 from collections import defaultdict
@@ -390,6 +391,48 @@ class LocalAgendaEntity(CalendarEntity):
                 )
 
         await self._async_saved()
+
+    async def async_move_series(
+        self, uid: str, event: dict[str, Any], target: LocalAgendaEntity
+    ) -> str:
+        """Move a whole series to `target`, applying the edit `event`.
+
+        The series keeps its modified occurrences (RECURRENCE-ID) and its
+        deleted ones (EXDATE), exactly as an edit of the whole series would.
+        It gets a new uid in the target.  The source calendar is changed only
+        once the target has been saved, so a failure loses nothing.
+        """
+        cal = self._store.get_calendar()
+        master = _find_master(cal, uid)
+        if master is None:
+            raise HomeAssistantError(f"local_agenda: event {uid} not found")
+        new_rrule = _parse_rrule(event.get("rrule"))
+        new_start = event.get("dtstart")
+        new_end = event.get("dtend")
+
+        # Edit a copy of the series, then give it its new uid.
+        series = Calendar()
+        series.subcomponents = [
+            copy.deepcopy(c)
+            for c in cal.subcomponents
+            if c.name == "VEVENT" and str(c.get("uid", "")) == uid
+        ]
+        _update_whole_series(
+            series, _find_master(series, uid), uid, event, new_start, new_end, new_rrule
+        )
+        new_uid = str(uuid.uuid4())
+        for component in series.subcomponents:
+            component.pop("uid", None)
+            component.add("uid", new_uid)
+
+        target_cal = target._store.get_calendar()
+        for component in series.subcomponents:
+            target_cal.add_component(component)
+        await target._async_saved()
+
+        _remove_uid(cal, uid)
+        await self._async_saved()
+        return new_uid
 
 
 # ------------------------------------------------------------------
