@@ -8,7 +8,7 @@
 // ("2026-11-10T06:30", or "2026-11-10" for an all-day event), so the panel
 // never converts between time zones itself.
 
-const VERSION = "2.0.0";
+const VERSION = "2.0.3";
 console.info(`%c[local_agenda] panel.js v${VERSION} loaded`, "color:#03a9f4;font-weight:bold;");
 
 // ---------------------------------------------------------------------------
@@ -488,6 +488,7 @@ ha-icon.ic { --mdc-icon-size: 18px; width: 18px; height: 18px; display: inline-f
 .ev.ko { background: repeating-linear-gradient(135deg, var(--la-soft) 0 5px, var(--la-card) 5px 10px); color: var(--la-text2); }
 .ev.ko .t { text-decoration: line-through; }
 .ev.susp { opacity: .55; }
+.ev.dis { opacity: .6; background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--evc) 22%, var(--la-card)) 0 5px, var(--la-card) 5px 10px); }
 .ev.other { border-left-color: var(--la-text2); background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--evc) 18%, var(--la-card)) 0 5px, var(--la-card) 5px 10px);
   border: 1px dashed color-mix(in srgb, var(--evc) 70%, var(--la-card)); cursor: default; }
 .ev .resize { position: absolute; left: 0; right: 0; bottom: 0; height: 7px; cursor: ns-resize; touch-action: none; }
@@ -552,6 +553,10 @@ ha-icon.ic { --mdc-icon-size: 18px; width: 18px; height: 18px; display: inline-f
 .colors { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
 .sw { width: 24px; height: 24px; border-radius: 50%; border: 1px solid var(--la-line); padding: 0; }
 .sw.on { box-shadow: 0 0 0 2px var(--la-card), 0 0 0 4px var(--la-text); }
+.sw { display: inline-flex; align-items: center; justify-content: center; color: #fff; }
+.sw .swcheck { --mdc-icon-size: 16px; filter: drop-shadow(0 0 1px rgba(0,0,0,.6)); }
+.swnone { border: 1px solid var(--la-line); background: var(--la-card); border-radius: 14px; padding: 3px 11px; display: inline-flex; gap: 4px; align-items: center; }
+.swnone.on { box-shadow: 0 0 0 1px var(--la-text); border-color: var(--la-text); font-weight: 500; }
 .daychips { display: flex; gap: 5px; flex-wrap: wrap; }
 .dchip { width: 32px; height: 32px; border-radius: 50%; border: 1px solid var(--la-line); background: var(--la-card); }
 .dchip.on { background: var(--la-accent); color: var(--text-primary-color, #fff); border-color: var(--la-accent); }
@@ -561,7 +566,9 @@ ha-icon.ic { --mdc-icon-size: 18px; width: 18px; height: 18px; display: inline-f
 .row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
 
 /* Phase sections and cards (start / end rules) */
-.phase { border: 1px solid var(--la-line); border-radius: 12px; margin: 8px 16px; overflow: hidden; }
+.phase { border: 1px solid var(--la-line); border-radius: 12px; margin: 8px 16px; }
+.phase > .hd { border-radius: 12px; }
+.phase.open > .hd { border-radius: 12px 12px 0 0; }
 .phase > .hd, .card > .hd { display: flex; align-items: center; gap: 8px; padding: 8px 10px; cursor: pointer; user-select: none; }
 .phase > .hd:hover, .card > .hd:hover { background: var(--la-soft); }
 .phase > .hd .name { font-weight: 500; }
@@ -573,7 +580,9 @@ ha-icon.ic { --mdc-icon-size: 18px; width: 18px; height: 18px; display: inline-f
 .sepv { width: 1px; height: 20px; background: var(--la-line); margin: 0 2px; flex-shrink: 0; }
 .subhead { display: flex; align-items: center; gap: 8px; margin: 12px 0 4px; flex-wrap: wrap; }
 .subhead .t { font-weight: 500; }
-.card { border: 1px solid var(--la-line); border-radius: 9px; margin-top: 6px; background: var(--la-card); overflow: hidden; }
+.card { border: 1px solid var(--la-line); border-radius: 9px; margin-top: 6px; background: var(--la-card); }
+.card > .hd { border-radius: 8px; }
+.card.open > .hd { border-radius: 8px 8px 0 0; }
 .card.open { border-color: color-mix(in srgb, var(--la-text) 25%, var(--la-card)); }
 .card.open > .hd { background: var(--la-soft); border-bottom: 1px solid var(--la-line); }
 .card > .bd { padding: 8px 12px 12px 22px; margin: 6px 0 6px 12px; border-left: 2px solid var(--la-accent); display: flex; flex-direction: column; gap: 8px; }
@@ -1642,27 +1651,40 @@ class EventEditor {
 
     // Color
     this.color = d.color;
+    // The event's own color.  "Aucune" means the event takes its calendar's
+    // color, which is set from the calendar column, not here.
     const colors = el("div", { class: "colors" });
+    const colorHint = el("div", { class: "hint", style: "margin-top:6px" });
+    const check = () => icon("mdi:check", "swcheck");
     const paintColors = () => {
       colors.innerHTML = "";
-      const ac = agendaColor(this.panel.cal(this.agendaSel ? this.agendaSel.value : this.entryId), this.panel.calIndex(this.entryId));
-      colors.append(el("button", { type: "button", class: `btn ${!this.color ? "primary" : ""}`, style: "padding:2px 9px 2px 3px",
+      const id = this.agendaSel ? this.agendaSel.value : this.entryId;
+      const cal = this.panel.cal(id);
+      const ac = agendaColor(cal, this.panel.calIndex(id));
+      colors.append(el("button", { type: "button", class: `swnone ${!this.color ? "on" : ""}`, "aria-pressed": String(!this.color),
         onclick: () => { this.color = null; paintColors(); this.changed(); } },
-        el("span", { class: "dot", style: `width:16px;height:16px;background:${ac}` }), "Couleur de l'agenda"));
+        !this.color ? check() : null, "Aucune"));
       for (const [name, label] of EVENT_COLORS) {
         colors.append(el("button", { type: "button", class: `sw ${this.color === name ? "on" : ""}`, title: label, "aria-label": label,
-          style: `background:${name}`, onclick: () => { this.color = name; paintColors(); this.changed(); } }));
+          "aria-pressed": String(this.color === name),
+          style: `background:${name}`, onclick: () => { this.color = name; paintColors(); this.changed(); } },
+          this.color === name ? check() : null));
       }
       if (this.color && !EVENT_COLORS.some(c => c[0] === this.color)) {
-        colors.append(el("button", { type: "button", class: "sw on", title: this.color, style: `background:${this.color}` }));
+        colors.append(el("button", { type: "button", class: "sw on", title: this.color, style: `background:${this.color}` }, check()));
       }
+      colorHint.replaceChildren(
+        this.color ? "Couleur propre à cet événement." : "Sans couleur propre, l'événement prend celle de l'agenda ",
+        this.color ? "" : el("span", { class: "dot", style: `background:${ac};vertical-align:middle` }),
+        this.color ? "" : ` « ${cal ? cal.name : ""} » (modifiable dans la colonne des agendas, menu ⋮).`);
     };
     // Icon
     this.icon = d.icon;
     const icons = el("div", { class: "colors" });
     const paintIcons = () => {
       icons.innerHTML = "";
-      icons.append(el("button", { type: "button", class: `btn ${!this.icon ? "primary" : ""}`, text: "Aucune", onclick: () => { this.icon = null; paintIcons(); this.changed(); } }));
+      icons.append(el("button", { type: "button", class: `swnone ${!this.icon ? "on" : ""}`, "aria-pressed": String(!this.icon),
+        onclick: () => { this.icon = null; paintIcons(); this.changed(); } }, !this.icon ? icon("mdi:check", "swcheck") : null, "Aucune"));
       for (const name of EVENT_ICONS) {
         icons.append(el("button", { type: "button", class: `iconbtn`, title: name,
           style: this.icon === name ? "outline:2px solid var(--la-text);color:var(--la-text)" : "",
@@ -1707,8 +1729,8 @@ class EventEditor {
     this.dialog = el("div", { class: "dialog", role: "dialog", "aria-modal": "true" },
       head, scopeBar, this.errBox,
       el("div", { class: "dlg-sec" }, el("span", { class: "lbl", text: "Titre" }), this.titleIn),
-      el("div", { class: "dlg-sec" }, el("span", { class: "lbl", text: "Couleur" }), colors),
-      el("div", { class: "dlg-sec" }, el("span", { class: "lbl", text: "Icône (facultative)" }), icons),
+      el("div", { class: "dlg-sec" }, el("span", { class: "lbl", text: "Couleur de l'événement" }), colors, colorHint),
+      el("div", { class: "dlg-sec" }, el("span", { class: "lbl", text: "Icône de l'événement (facultative)" }), icons),
       el("div", { class: "dlg-sec" }, el("span", { class: "lbl", text: "Agenda" }), this.agendaSel),
       this.whenBox, this.repeatBox,
       ...this.phases.map(p => p.root),
@@ -1966,6 +1988,55 @@ function assignLanes(items) {
   return lanes.length;
 }
 
+// The first entity an event's actions act on (its start actions, then its
+// end actions), or null.  Conditions are not looked at: they read entities,
+// they don't drive them.
+function drivenEntity(actions) {
+  const walk = (v) => {
+    if (Array.isArray(v)) { for (const x of v) { const r = walk(x); if (r) return r; } return null; }
+    if (!isPlainObject(v)) return null;
+    for (const [k, x] of Object.entries(v)) {
+      if (k === "conditions" || k === "condition" || k === "if") continue;
+      if (k === "entity_id") {
+        const id = Array.isArray(x) ? x[0] : x;
+        if (typeof id === "string" && /^[a-z_]+\.[a-z0-9_]+$/.test(id)) return id;
+      }
+    }
+    for (const [k, x] of Object.entries(v)) {
+      if (k === "conditions" || k === "condition" || k === "if") continue;
+      const r = walk(x);
+      if (r) return r;
+    }
+    return null;
+  };
+  const a = actions || {};
+  return walk(phaseSteps(a.on_start)) || walk(phaseSteps(a.on_stop));
+}
+
+// Lanes for one calendar of the house view: the events that drive the same
+// entity share their lines (more than one only when they overlap); the
+// events that drive nothing come last.
+function assignGroupedLanes(items) {
+  const groups = new Map();
+  for (const it of items) {
+    const key = (it.occ && drivenEntity(it.occ.actions)) || "\uffff";
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(it);
+  }
+  const order = [...groups.entries()].sort((a, b) => {
+    if (a[0] === "\uffff") return 1;
+    if (b[0] === "\uffff") return -1;
+    return Math.min(...a[1].map(x => x.s)) - Math.min(...b[1].map(x => x.s)) || a[0].localeCompare(b[0]);
+  });
+  let offset = 0;
+  for (const [, list] of order) {
+    const n = assignLanes(list);
+    list.forEach(it => { it.lane += offset; });
+    offset += n;
+  }
+  return offset;
+}
+
 // Side-by-side columns for overlapping blocks of one day column.
 function layoutColumns(items) {
   const sorted = items.slice().sort((a, b) => a.s - b.s || b.e - a.e);
@@ -2028,7 +2099,11 @@ class LocalAgendaPanel extends HTMLElement {
   cal(id) { return this._cals.find(c => c.entry_id === id); }
   calIndex(id) { return Math.max(0, this._cals.findIndex(c => c.entry_id === id)); }
   calColor(id) { return agendaColor(this.cal(id), this.calIndex(id)); }
-  hidden(id) { return (this.prefs.hidden || []).includes(id); }
+  hidden(id) {
+    const cal = this.cal(id);
+    if (cal && cal.disabled && !this.prefs.showDisabled) return true;
+    return (this.prefs.hidden || []).includes(id);
+  }
   otherSelected() { return (this.prefs.others || []).filter(id => this._hass.states[id]); }
   otherColor(id) { const all = this.otherCalendars(); return OTHER_COLORS[Math.max(0, all.indexOf(id)) % OTHER_COLORS.length]; }
   otherCalendars() {
@@ -2048,6 +2123,11 @@ class LocalAgendaPanel extends HTMLElement {
       const later = () => { clearTimeout(this._reloadT); this._reloadT = setTimeout(() => this.reload(), 300); };
       this._unsubs.push(this._hass.connection.subscribeEvents(later, "local_agenda_updated"));
       this._unsubs.push(this._hass.connection.subscribeEvents(() => { if (this.view === "runs") later(); }, "local_agenda_history"));
+      // A calendar entity enabled or disabled (by hand, or by an automation).
+      this._unsubs.push(this._hass.connection.subscribeEvents((ev) => {
+        const id = ev && ev.data && ev.data.entity_id;
+        if (!id || id.startsWith("calendar.")) later();
+      }, "entity_registry_updated"));
     }
     this.startTimer();
     // Switch between the phone and desktop layouts when the width crosses the limit.
@@ -2201,7 +2281,7 @@ class LocalAgendaPanel extends HTMLElement {
   }
 
   renderPills() {
-    return el("div", { class: "pills" }, ...this._cals.map((c, i) => el("button", {
+    return el("div", { class: "pills" }, ...this._cals.map((c, i) => (c.disabled && !this.prefs.showDisabled) ? null : el("button", {
       type: "button", class: `pill ${this.hidden(c.entry_id) ? "off" : ""}`, onclick: () => this.toggleHidden(c.entry_id),
     }, el("span", { class: "dot", style: `background:${agendaColor(c, i)}` }), c.name)));
   }
@@ -2214,6 +2294,7 @@ class LocalAgendaPanel extends HTMLElement {
   }
 
   statusOf(cal) {
+    if (cal.disabled) return "Désactivé : aucune action";
     if (cal.suspended) return "Suspendu";
     const now = this.now;
     const occ = (this._status[cal.entry_id] || []).map(o => ({ o, s: wm(o.start), e: wm(o.end) }));
@@ -2228,13 +2309,15 @@ class LocalAgendaPanel extends HTMLElement {
 
   renderSide(narrow) {
     const side = el("div", { class: `side ${narrow ? "drawer" : ""}` });
-    const allVisible = this._cals.every(c => !this.hidden(c.entry_id));
+    const listed = this._cals.filter(c => !c.disabled || this.prefs.showDisabled);
+    const allVisible = listed.every(c => !this.hidden(c.entry_id));
     side.append(el("div", { class: "calrow" },
       el("span", { class: "calbox", style: `border-color:var(--la-text2);${allVisible ? "background:var(--la-text2)" : ""}`,
         onclick: () => { this.setPrefs({ hidden: allVisible ? this._cals.map(c => c.entry_id) : [] }); this.renderAll(true); } },
         allVisible ? icon("mdi:check") : null),
       el("span", { class: "calname", text: "Tous" })));
-    this._cals.forEach((c, i) => {
+    const disabled = this._cals.filter(c => c.disabled);
+    const calRow = (c, i) => {
       const color = agendaColor(c, i);
       const vis = !this.hidden(c.entry_id);
       const more = el("button", { type: "button", class: "iconbtn", "aria-label": "Options de l'agenda" }, icon("mdi:dots-vertical"));
@@ -2243,14 +2326,31 @@ class LocalAgendaPanel extends HTMLElement {
         { label: "Renommer", icon: "mdi:pencil-outline", action: () => this.renameAgenda(c) },
         { label: c.suspended ? "Reprendre" : "Suspendre", icon: c.suspended ? "mdi:play" : "mdi:pause", action: () => this.setSuspended(c, !c.suspended) },
       ]));
-      side.append(el("div", { class: `calrow ${c.suspended ? "off" : ""}` },
-        el("span", { class: "calbox", style: `border-color:${color};${vis ? "background:" + color : ""}`, title: vis ? "Masquer" : "Afficher",
-          onclick: () => this.toggleHidden(c.entry_id) }, vis ? icon("mdi:check") : null),
+      const canShow = !c.disabled || this.prefs.showDisabled;
+      return el("div", { class: `calrow ${c.suspended || c.disabled ? "off" : ""}` },
+        el("span", { class: "calbox", style: `border-color:${color};${vis ? "background:" + color : ""}`, title: canShow ? (vis ? "Masquer" : "Afficher") : "Désactivé dans Home Assistant",
+          onclick: () => canShow && this.toggleHidden(c.entry_id) }, vis ? icon("mdi:check") : null),
         el("div", { style: "min-width:0;flex:1" }, el("div", { class: "calname", text: c.name }), el("div", { class: "calstat", text: this.statusOf(c) })),
-        el("button", { type: "button", class: `switch ${c.suspended ? "off" : ""}`, title: c.suspended ? "Reprendre" : "Suspendre",
-          "aria-label": c.suspended ? "Reprendre" : "Suspendre", onclick: () => this.setSuspended(c, !c.suspended) }),
-        more));
-    });
+        c.disabled
+          ? el("span", { class: "tag", style: "margin-top:2px", title: "Entité désactivée dans Home Assistant : le scheduleur n'exécute rien", text: "désactivé" })
+          : el("button", { type: "button", class: `switch ${c.suspended ? "off" : ""}`, title: c.suspended ? "Reprendre" : "Suspendre",
+            "aria-label": c.suspended ? "Reprendre" : "Suspendre", onclick: () => this.setSuspended(c, !c.suspended) }),
+        more);
+    };
+    this._cals.forEach((c, i) => { if (!c.disabled) side.append(calRow(c, i)); });
+    if (disabled.length) {
+      const open = !!this.prefs.disabledOpen;
+      side.append(el("div", { class: "sidehead row", style: "cursor:pointer;flex-wrap:nowrap",
+        onclick: (e) => { if (e.target.closest(".link")) return; this.setPrefs({ disabledOpen: !open }); this.renderAll(true); } },
+        icon(open ? "mdi:chevron-down" : "mdi:chevron-right"),
+        el("span", { style: "flex:1", text: `Désactivés dans Home Assistant (${disabled.length})` }),
+        el("button", { type: "button", class: "link", style: "padding:0", title: "Afficher ces agendas dans les vues",
+          onclick: () => { this.setPrefs({ showDisabled: !this.prefs.showDisabled, disabledOpen: true }); this.reload(); } },
+          this.prefs.showDisabled ? "Masquer" : "Afficher")));
+      if (open || this.prefs.showDisabled) {
+        this._cals.forEach((c, i) => { if (c.disabled) side.append(calRow(c, i)); });
+      }
+    }
     side.append(el("button", { type: "button", class: "link", onclick: () => this.createAgenda() }, icon("mdi:calendar-plus"), "Nouvel agenda"));
     const others = this.otherCalendars();
     if (others.length) {
@@ -2348,6 +2448,7 @@ class LocalAgendaPanel extends HTMLElement {
     if (it.kind === "other") cls.push("other");
     if (this.conditionsKo(it)) cls.push("ko");
     if (it.cal && it.cal.suspended) cls.push("susp");
+    if (it.cal && it.cal.disabled) cls.push("dis");
     const o = it.occ || {};
     const marks = el("span", { class: "marks" },
       o.icon ? icon(o.icon) : null,
@@ -2483,7 +2584,7 @@ class LocalAgendaPanel extends HTMLElement {
       ...[0, 3, 6, 9, 12, 15, 18, 21].map(h => el("span", { style: `position:absolute;left:${(h / 24) * 100}%`, text: `${pad2(h)}h` })))));
     const row = (name, sub, color, items, opts = {}) => {
       const inDay = items.filter(x => x.s < d + DAY && x.e > d).map(x => ({ ...x, s: Math.max(x.s, d), e: Math.min(x.e, d + DAY) }));
-      const lanes = Math.max(1, assignLanes(inDay));
+      const lanes = Math.max(1, assignGroupedLanes(inDay));
       const lane = el("div", { class: "hs-lane", style: `height:${lanes * 30 + 4}px` });
       for (const it of inDay) {
         const b = el("div", {
@@ -2503,7 +2604,7 @@ class LocalAgendaPanel extends HTMLElement {
     const items = this.items();
     this._cals.forEach((c, i) => {
       if (this.hidden(c.entry_id)) return;
-      row(c.name, c.suspended ? "suspendu" : null, agendaColor(c, i), items.filter(x => x.entry === c.entry_id), { dim: c.suspended });
+      row(c.name, c.disabled ? "désactivé" : (c.suspended ? "suspendu" : null), agendaColor(c, i), items.filter(x => x.entry === c.entry_id), { dim: c.suspended || c.disabled });
     });
     const others = this.otherSelected();
     if (others.length) box.append(el("div", { class: "hs-sep" }));
@@ -2565,7 +2666,8 @@ class LocalAgendaPanel extends HTMLElement {
     for (const u of upcoming) {
       const n = phaseSteps(u.o.actions[u.phase]).length;
       const met = phaseConditionsMet(u.o.actions[u.phase], this._hass.states);
-      const tag = u.c.suspended ? el("span", { class: "tag", text: "agenda suspendu" })
+      const tag = u.c.disabled ? el("span", { class: "tag", text: "agenda désactivé" })
+        : u.c.suspended ? el("span", { class: "tag", text: "agenda suspendu" })
         : met === null ? el("span", { class: "tag", text: "sans condition" })
           : el("span", { class: `tag ${met ? "ok" : "ko"}`, text: met ? "conditions remplies" : "non remplies en ce moment" });
       box.append(el("div", { class: "litem", onclick: () => this.openOcc({ kind: "local", entry: u.c.entry_id, cal: u.c, occ: u.o }) },

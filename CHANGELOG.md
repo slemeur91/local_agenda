@@ -3,6 +3,38 @@
 Les versions antérieures à la 1.2.0 sont décrites dans les
 [releases GitHub](https://github.com/slemeur91/local_agenda/releases).
 
+## 1.4.1 – 2026-11-11
+
+### Ajout
+
+- **Agendas désactivés dans Home Assistant** (entité désactivée à la main ou
+  par une automatisation) : masqués par défaut dans les vues du panneau et
+  regroupés dans une section repliée « Désactivés dans Home Assistant » de
+  la colonne des agendas, avec la mention « Désactivé : aucune action ». Le
+  lien « Afficher » les fait apparaître, pâles et hachurés, pour modifier
+  leurs événements. Le panneau suit en direct l'activation et la
+  désactivation de ces entités.
+- **Vue Maison : une ligne par entité pilotée.** Dans un agenda, les
+  événements qui pilotent la même entité (d'après leurs actions) restent sur
+  la même ligne : par exemple les séances Étage d'un côté, les séances RDC
+  de l'autre. Les événements sans action vont sur une dernière ligne.
+
+### Corrections
+
+- **Agenda dont l'entité est désactivée** : enregistrer un événement depuis
+  le panneau affichait « Unknown error » (l'enregistrement avait pourtant
+  lieu). L'état de l'entité n'est plus écrit quand elle est désactivée.
+- **Clé `service:` préservée** : la vérification des actions à
+  l'enregistrement la réécrivait en `action:` (équivalent pour Home
+  Assistant). Le bloc enregistré reste désormais tel qu'il a été écrit.
+- **Panneau (panel.js 2.0.3)** : la liste de choix d'une entité, d'une scène
+  ou d'un script était coupée par le bord de la carte d'action ; elle
+  s'affiche maintenant en entier par-dessus.
+- **Éditeur : couleur de l'événement** : le champ s'intitule « Couleur de
+  l'événement » ; le premier choix, « Aucune », indique que l'événement prend
+  la couleur de son agenda (rappelée en dessous, avec où la modifier) ; le
+  choix sélectionné porte une coche. Même présentation pour l'icône.
+
 ## 1.4.0 – 2026-11-10
 
 Nouvelle interface du panneau (panel.js 2.0.0), inspirée de celle

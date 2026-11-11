@@ -243,8 +243,17 @@ class LocalAgendaEntity(CalendarEntity):
         """Persist the calendar and publish the change."""
         await self._store.async_save(self._hass)
         await self._refresh_next_event()
-        self.async_write_ha_state()
+        self.write_state()
         self._notify_panel_updated()
+
+    def write_state(self) -> None:
+        """Write the entity state, if the entity is in Home Assistant.
+
+        A calendar whose entity is disabled has no state to write, but the
+        panel still edits its events.
+        """
+        if self.hass is not None:
+            self.async_write_ha_state()
 
     async def async_create_event(self, **kwargs: Any) -> str:
         """Create a new event (called by HA frontend)."""

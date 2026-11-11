@@ -63,6 +63,7 @@ name), `phase` ("start" / "stop") and `event` (`uid`, `summary`,
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
@@ -325,7 +326,9 @@ async def async_validate_steps(hass: HomeAssistant, steps: Any) -> list[str]:
     errors = []
     for index, step in enumerate(steps, start=1):
         try:
-            await async_validate_actions_config(hass, cv.SCRIPT_SCHEMA([step]))
+            # Validation normalises in place (service → action): work on a
+            # copy so the block that gets saved stays as it was written.
+            await async_validate_actions_config(hass, cv.SCRIPT_SCHEMA([copy.deepcopy(step)]))
         except (vol.Invalid, HomeAssistantError) as err:
             errors.append(f"action {index}: {err}")
     return errors
@@ -339,7 +342,7 @@ async def _async_script(
     key = json.dumps([name, steps], sort_keys=True, default=str)
     if (script := scripts.get(key)) is None:
         validated = await async_validate_actions_config(
-            hass, cv.SCRIPT_SCHEMA(steps)
+            hass, cv.SCRIPT_SCHEMA(copy.deepcopy(steps))
         )
         script = Script(
             hass,

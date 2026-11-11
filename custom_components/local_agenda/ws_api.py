@@ -64,18 +64,27 @@ def ws_list_calendars(
     connection: websocket_api.ActiveConnection,
     msg: dict,
 ) -> None:
-    """Return all local_agenda config entries with their calendar name."""
+    """Return all local_agenda config entries with their calendar name.
+
+    `disabled` is true when the calendar entity is disabled in Home Assistant
+    (by hand or by an automation): the scheduler then runs nothing for it.
+    """
+    from homeassistant.helpers import entity_registry as er
+
+    registry = er.async_get(hass)
     entries = hass.config_entries.async_entries(DOMAIN)
     result = []
     for entry in entries:
-        entities = hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("entities", [])
+        entity_id = registry.async_get_entity_id("calendar", DOMAIN, f"local_agenda_{entry.entry_id}")
+        reg_entry = registry.async_get(entity_id) if entity_id else None
         result.append(
             {
                 "entry_id": entry.entry_id,
                 "name": entry.title,
-                "entity_id": entities[0].entity_id if entities else None,
+                "entity_id": entity_id,
                 "color": entry.options.get("color"),
                 "suspended": bool(entry.options.get("suspended")),
+                "disabled": bool(reg_entry and reg_entry.disabled_by),
             }
         )
     connection.send_result(msg["id"], result)
@@ -271,7 +280,7 @@ async def _refresh_entities(hass: HomeAssistant, entry_id: str) -> None:
     for entity in hass.data.get(DOMAIN, {}).get(entry_id, {}).get("entities", []):
         try:
             await entity._refresh_next_event()
-            entity.async_write_ha_state()
+            entity.write_state()
             entity._notify_panel_updated()
         except Exception as err:
             _LOGGER.warning(
@@ -627,7 +636,7 @@ async def ws_agenda_update(
         # The entity name follows the title; its entity_id never changes.
         for entity in hass.data.get(DOMAIN, {}).get(entry.entry_id, {}).get("entities", []):
             entity._attr_name = title
-            entity.async_write_ha_state()
+            entity.write_state()
             entity._notify_panel_updated()
         return {"ok": True}
 
